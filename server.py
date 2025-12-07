@@ -4,9 +4,10 @@ import base64
 import binascii
 from typing import Optional
 
-from fastapi import FastAPI, UploadFile, HTTPException, Query
+from fastapi import FastAPI, UploadFile, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import RequestValidationError
 from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
 from PIL import Image
@@ -45,6 +46,68 @@ app.add_middleware(
 )
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+
+# ============== GLOBAL ERROR HANDLERS ==============
+# These catch ALL errors so the server never crashes!
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Catch-all handler for any unhandled exception - server stays alive!"""
+    print(f"[ERROR] Unhandled exception: {type(exc).__name__}: {str(exc)}")
+    return JSONResponse(
+        status_code=500,
+        content={
+            "success": False,
+            "error": "Internal server error",
+            "detail": str(exc),
+            "type": type(exc).__name__
+        }
+    )
+
+
+@app.exception_handler(EscposError)
+async def escpos_exception_handler(request: Request, exc: EscposError):
+    """Handle printer-specific errors"""
+    print(f"[PRINTER ERROR] {str(exc)}")
+    return JSONResponse(
+        status_code=500,
+        content={
+            "success": False,
+            "error": "Printer error",
+            "detail": str(exc),
+            "type": "PrinterError"
+        }
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Handle invalid request parameters"""
+    return JSONResponse(
+        status_code=422,
+        content={
+            "success": False,
+            "error": "Validation error",
+            "detail": exc.errors(),
+            "type": "ValidationError"
+        }
+    )
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Handle HTTP exceptions consistently"""
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "success": False,
+            "error": exc.detail,
+            "type": "HTTPException"
+        }
+    )
+
+# ============== END ERROR HANDLERS ==============
 
 
 def allowed_file(filename: str) -> bool:
