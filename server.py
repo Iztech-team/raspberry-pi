@@ -95,7 +95,7 @@ async def print_text(
     text: str = Query(..., description="Text to print"),
     printer: str = Query("printer_1", description="Printer name"),
     printer_name: str = Query(None, description="Printer name (backward compatibility)"),
-    lines_after: int = Query(5, description="Feed lines before cut"),
+    lines_after: int = Query(1, description="Feed lines before cut"),
     cut: bool = Query(True, description="Auto cut after printing"),
     bold: bool = Query(False, description="Bold text"),
     underline: int = Query(0, description="Underline mode (0=none, 1=single, 2=double)"),
@@ -167,10 +167,10 @@ async def print_image(
     image: UploadFile,
     printer: str = Query("printer_1", description="Printer name"),
     printer_name: str = Query(None, description="Printer name (backward compatibility)"),
-    lines_after: int = Query(5, description="Feed lines before cut"),
+    lines_after: int = Query(1, description="Feed lines before cut"),
     cut: bool = Query(True, description="Auto cut after printing"),
     center: bool = Query(True, description="Center image"),
-    paper_width: int = Query(576, description="Paper width in pixels (576 for 80mm, 384 for 58mm)")
+    paper_width: int = Query(550, description="Paper width in pixels (550 for 80mm, 370 for 58mm)")
 ):
     """
     Print image to thermal printer using python-escpos
@@ -258,7 +258,7 @@ async def print_qr(
     text: str = Query(..., description="Text to encode in QR code"),
     printer: str = Query("printer_1", description="Printer name"),
     size: int = Query(3, description="QR code size (1-8)"),
-    lines_after: int = Query(5, description="Feed lines before cut"),
+    lines_after: int = Query(1, description="Feed lines before cut"),
     cut: bool = Query(True, description="Auto cut after printing"),
     center: bool = Query(True, description="Center QR code")
 ):
@@ -308,7 +308,7 @@ async def print_barcode(
     barcode_type: str = Query("CODE39", description="Barcode type (EAN13, CODE39, etc)"),
     height: int = Query(64, description="Barcode height"),
     width: int = Query(2, description="Barcode width"),
-    lines_after: int = Query(5, description="Feed lines before cut"),
+    lines_after: int = Query(1, description="Feed lines before cut"),
     cut: bool = Query(True, description="Auto cut after printing"),
     center: bool = Query(True, description="Center barcode")
 ):
@@ -355,7 +355,7 @@ async def print_barcode(
 async def cut_paper(
     printer: str = Query("printer_1", description="Printer name"),
     printer_name: str = Query(None, description="Printer name (backward compatibility)"),
-    lines_before: int = Query(5, description="Feed lines before cut"),
+    lines_before: int = Query(1, description="Feed lines before cut"),
     feed: int = Query(None, description="Feed lines (backward compatibility)"),
     mode: str = Query("partial", description="Cut mode (backward compatibility)")
 ):
