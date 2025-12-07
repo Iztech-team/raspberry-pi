@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
+from PIL import Image
 
 # ESC/POS library - NO MORE PPD/CUPS BULLSHIT!
 from escpos.printer import Network
@@ -168,13 +169,14 @@ async def print_image(
     printer_name: str = Query(None, description="Printer name (backward compatibility)"),
     lines_after: int = Query(5, description="Feed lines before cut"),
     cut: bool = Query(True, description="Auto cut after printing"),
-    center: bool = Query(True, description="Center image")
+    center: bool = Query(True, description="Center image"),
+    paper_width: int = Query(576, description="Paper width in pixels (576 for 80mm, 384 for 58mm)")
 ):
     """
     Print image to thermal printer using python-escpos
     
     Supports both /print-image and /print/image endpoints
-    The library handles image conversion automatically with built-in dithering!
+    Images are automatically resized to fit the paper width!
     """
     # Support both 'printer' and 'printer_name' for backward compatibility
     if printer_name:
@@ -198,6 +200,15 @@ async def print_image(
         
         with open(filepath, "wb") as f:
             f.write(content)
+        
+        # Resize image to fit paper width
+        img = Image.open(filepath)
+        if img.width > paper_width:
+            # Calculate new height maintaining aspect ratio
+            ratio = paper_width / img.width
+            new_height = int(img.height * ratio)
+            img = img.resize((paper_width, new_height), Image.Resampling.LANCZOS)
+            img.save(filepath)
         
         # Print using python-escpos
         p = get_printer(printer)
