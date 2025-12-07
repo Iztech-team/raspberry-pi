@@ -168,9 +168,6 @@ async def print_image(
     printer_name: str = Query(None, description="Printer name (backward compatibility)"),
     lines_after: int = Query(5, description="Feed lines before cut"),
     cut: bool = Query(True, description="Auto cut after printing"),
-    impl: str = Query("bitImageRaster", description="Image implementation (bitImageRaster, bitImageColumn, graphics)"),
-    high_density_horizontal: bool = Query(False, description="High density horizontal"),
-    high_density_vertical: bool = Query(False, description="High density vertical"),
     center: bool = Query(True, description="Center image")
 ):
     """
@@ -210,12 +207,7 @@ async def print_image(
             p.set(align='center')
         
         # Print image - library handles all conversion with automatic dithering!
-        p.image(
-            filepath,
-            impl=impl,
-            high_density_horizontal=high_density_horizontal,
-            high_density_vertical=high_density_vertical
-        )
+        p.image(filepath)
         
         # Reset alignment
         if center:
@@ -234,8 +226,7 @@ async def print_image(
             "message": f"Image printed to {printer}",
             "printer": printer,
             "filename": filename,
-            "lines_after": lines_after,
-            "implementation": impl
+            "lines_after": lines_after
         }
         
     except EscposError as e:
