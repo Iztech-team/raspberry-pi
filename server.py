@@ -27,7 +27,7 @@ SERVER_PORT = int(os.getenv("SERVER_PORT", "3006"))
 
 # Printer configurations
 PRINTERS = {
-    "printer_1": {"host": "192.168.1.10", "port": 9100},
+    "printer_1": {"host": "192.168.1.87", "port": 9100},
     "printer_2": {"host": "192.168.1.105", "port": 9100},
 }
 
