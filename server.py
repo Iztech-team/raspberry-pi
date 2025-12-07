@@ -169,8 +169,8 @@ async def print_image(
     lines_after: int = Query(5, description="Feed lines before cut"),
     cut: bool = Query(True, description="Auto cut after printing"),
     impl: str = Query("bitImageRaster", description="Image implementation (bitImageRaster, bitImageColumn, graphics)"),
-    high_density_horizontal: bool = Query(True, description="High density horizontal"),
-    high_density_vertical: bool = Query(True, description="High density vertical"),
+    high_density_horizontal: bool = Query(False, description="High density horizontal"),
+    high_density_vertical: bool = Query(False, description="High density vertical"),
     center: bool = Query(True, description="Center image")
 ):
     """
