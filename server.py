@@ -163,7 +163,7 @@ async def print_text(
 @app.post("/print-image")
 @app.post("/print/image")
 async def print_image(
-    file: UploadFile,
+    image: UploadFile,
     printer: str = Query("printer_1", description="Printer name"),
     printer_name: str = Query(None, description="Printer name (backward compatibility)"),
     lines_after: int = Query(5, description="Feed lines before cut"),
@@ -183,19 +183,19 @@ async def print_image(
     if printer_name:
         printer = printer_name
     
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="No file provided")
+    if not image.filename:
+        raise HTTPException(status_code=400, detail="No image provided")
     
-    if not allowed_file(file.filename):
-        raise HTTPException(status_code=400, detail=f"Invalid file type. Allowed: {ALLOWED_EXTENSIONS}")
+    if not allowed_file(image.filename):
+        raise HTTPException(status_code=400, detail=f"Invalid image type. Allowed: {ALLOWED_EXTENSIONS}")
     
-    # Save uploaded file
-    filename = secure_filename(file.filename)
+    # Save uploaded image
+    filename = secure_filename(image.filename)
     unique_filename = f"{uuid.uuid4()}_{filename}"
     filepath = os.path.join(UPLOAD_FOLDER, unique_filename)
     
     try:
-        content = await file.read()
+        content = await image.read()
         if len(content) > MAX_CONTENT_LENGTH:
             raise HTTPException(status_code=413, detail="File too large")
         
