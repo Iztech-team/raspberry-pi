@@ -2,6 +2,7 @@ import os
 import uuid
 import base64
 import binascii
+import tempfile
 from typing import Tuple
 
 import cups
@@ -157,7 +158,21 @@ def send_to_cups(queue_name: str, data: bytes, title: str) -> int:
             "raw": "true",
             "document-format": "application/vnd.cups-raw",
         }
-        return conn.printData(queue_name, title, data, options)
+        if hasattr(conn, "printData"):
+            return conn.printData(queue_name, title, data, options)
+
+        # Fallback for older pycups without printData: write to a temp file and use printFile
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            tmp.write(data)
+            tmp.flush()
+            tmp_path = tmp.name
+        try:
+            return conn.printFile(queue_name, tmp_path, title, options)
+        finally:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
     except HTTPException:
         raise
     except cups.IPPError as e:
