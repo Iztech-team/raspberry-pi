@@ -111,23 +111,22 @@ def get_system_uptime():
 
 
 def generate_boot_receipt(printer_info, server_info, logo_path=None):
-    """Generate a boot notification receipt image"""
+    """Generate a boot notification receipt image - matches test print format"""
     
     # Create image (576px width for 80mm thermal printer)
     width = 576
-    height = 1400
+    height = 1600
     img = Image.new('RGB', (width, height), 'white')
     draw = ImageDraw.Draw(img)
     
     # Load fonts
     try:
-        title_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 28)
-        header_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 20)
+        title_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 24)
+        header_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 18)
         normal_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 16)
         small_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)
-        emoji_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 36)
     except:
-        title_font = header_font = normal_font = small_font = emoji_font = ImageFont.load_default()
+        title_font = header_font = normal_font = small_font = ImageFont.load_default()
     
     y = 20
     padding = 20
@@ -136,7 +135,7 @@ def generate_boot_receipt(printer_info, server_info, logo_path=None):
     if logo_path and os.path.exists(logo_path):
         try:
             logo = Image.open(logo_path)
-            logo_max_width = 350
+            logo_max_width = 400
             if logo.width > logo_max_width:
                 ratio = logo_max_width / logo.width
                 new_height = int(logo.height * ratio)
@@ -152,133 +151,120 @@ def generate_boot_receipt(printer_info, server_info, logo_path=None):
                 logo = logo.convert('RGB')
             
             img.paste(logo, (logo_x, y))
-            y += logo.height + 15
+            y += logo.height + 20
         except:
             pass
     
-    # Status indicator (checkmark)
-    status_text = "ONLINE"
-    bbox = draw.textbbox((0, 0), status_text, font=title_font)
-    status_width = bbox[2] - bbox[0]
-    draw.text(((width - status_width) // 2, y), status_text, fill='black', font=title_font)
-    y += 45
-    
-    # Main message
-    main_msg = "I'm up and ready"
-    bbox = draw.textbbox((0, 0), main_msg, font=header_font)
+    # STATUS MESSAGE AT TOP (unique to boot notification)
+    status_msg = "I'm up and ready"
+    bbox = draw.textbbox((0, 0), status_msg, font=title_font)
     msg_width = bbox[2] - bbox[0]
-    draw.text(((width - msg_width) // 2, y), main_msg, fill='black', font=header_font)
-    y += 30
+    draw.text(((width - msg_width) // 2, y), status_msg, fill='black', font=title_font)
+    y += 35
     
-    main_msg2 = "to get back to work!"
-    bbox = draw.textbbox((0, 0), main_msg2, font=header_font)
+    status_msg2 = "to get back to work!"
+    bbox = draw.textbbox((0, 0), status_msg2, font=title_font)
     msg_width = bbox[2] - bbox[0]
-    draw.text(((width - msg_width) // 2, y), main_msg2, fill='black', font=header_font)
-    y += 45
+    draw.text(((width - msg_width) // 2, y), status_msg2, fill='black', font=title_font)
+    y += 50
     
-    # Divider line
+    # Draw line
     draw.line([(padding, y), (width - padding, y)], fill='black', width=2)
     y += 20
     
-    # Printer Information Section
-    draw.text((padding, y), "PRINTER INFO", fill='black', font=header_font)
+    # SERVER INFORMATION Section (same as test print)
+    draw.text((padding, y), "SERVER INFORMATION", fill='black', font=header_font)
     y += 30
     
+    info_lines = [
+        ("Server IP:", server_info['local_ip']),
+        ("Server Port:", server_info.get('port', '3006')),
+        ("Hostname:", server_info['hostname']),
+    ]
+    
+    # Add Tailscale IP if available
+    if server_info.get('tailscale_ip'):
+        info_lines.append(("Tailscale IP:", server_info['tailscale_ip']))
+    
+    info_lines.append(("Local URL:", f"http://{server_info['local_ip']}:{server_info.get('port', '3006')}"))
+    
+    # Add Tailscale URL if available
+    if server_info.get('tailscale_ip'):
+        info_lines.append(("Remote URL:", f"http://{server_info['tailscale_ip']}:{server_info.get('port', '3006')}"))
+    
+    info_lines.append(("Installation:", server_info.get('install_dir', '/home/pi/printer-server')))
+    
+    for label, value in info_lines:
+        draw.text((padding, y), label, fill='black', font=normal_font)
+        draw.text((padding + 150, y), str(value), fill='black', font=normal_font)
+        y += 25
+    
+    y += 10
+    draw.line([(padding, y), (width - padding, y)], fill='black', width=2)
+    y += 20
+    
+    # PRINTER INFORMATION Section (same as test print)
+    draw.text((padding, y), "PRINTER INFORMATION", fill='black', font=header_font)
+    y += 30
+    
+    # Extract IP and port from URI
+    printer_ip = "unknown"
+    printer_port = "9100"
+    uri = printer_info.get('uri', '')
+    if '://' in uri:
+        try:
+            # Parse socket://192.168.1.100:9100
+            addr_part = uri.split('://')[1]
+            if ':' in addr_part:
+                printer_ip = addr_part.split(':')[0]
+                printer_port = addr_part.split(':')[1]
+            else:
+                printer_ip = addr_part
+        except:
+            pass
+    
     printer_lines = [
+        ("Printer IP:", printer_ip),
+        ("Printer Port:", printer_port),
         ("Printer Name:", printer_info['name']),
-        ("Printer URI:", ""),
     ]
     
     for label, value in printer_lines:
         draw.text((padding, y), label, fill='black', font=normal_font)
-        if value:
-            draw.text((padding + 140, y), value, fill='black', font=normal_font)
-        y += 25
-    
-    # URI on separate line (might be long)
-    uri_text = printer_info['uri']
-    if len(uri_text) > 35:
-        wrapped_uri = textwrap.fill(uri_text, width=40)
-        for line in wrapped_uri.split('\n'):
-            draw.text((padding + 15, y), line, fill='black', font=small_font)
-            y += 20
-    else:
-        draw.text((padding + 15, y), uri_text, fill='black', font=small_font)
+        draw.text((padding + 150, y), str(value), fill='black', font=normal_font)
         y += 25
     
     y += 10
     draw.line([(padding, y), (width - padding, y)], fill='black', width=2)
     y += 20
     
-    # Server Information Section
-    draw.text((padding, y), "SERVER INFO", fill='black', font=header_font)
+    # Timestamp
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    bbox = draw.textbbox((0, 0), timestamp, font=small_font)
+    ts_width = bbox[2] - bbox[0]
+    draw.text(((width - ts_width) // 2, y), timestamp, fill='black', font=small_font)
     y += 30
-    
-    server_lines = [
-        ("Hostname:", server_info['hostname']),
-        ("Local IP:", server_info['local_ip']),
-        ("Server Port:", server_info.get('port', '3006')),
-    ]
-    
-    if server_info.get('tailscale_ip'):
-        server_lines.append(("Tailscale IP:", server_info['tailscale_ip']))
-    
-    server_lines.append(("Uptime:", server_info['uptime']))
-    
-    for label, value in server_lines:
-        draw.text((padding, y), label, fill='black', font=normal_font)
-        draw.text((padding + 140, y), str(value), fill='black', font=normal_font)
-        y += 25
-    
-    y += 10
-    draw.line([(padding, y), (width - padding, y)], fill='black', width=2)
-    y += 20
-    
-    # Access URLs
-    draw.text((padding, y), "ACCESS URLS", fill='black', font=header_font)
-    y += 30
-    
-    local_url = f"http://{server_info['local_ip']}:{server_info.get('port', '3006')}"
-    draw.text((padding, y), "Local:", fill='black', font=normal_font)
-    y += 22
-    draw.text((padding + 15, y), local_url, fill='black', font=small_font)
-    y += 25
-    
-    if server_info.get('tailscale_ip'):
-        remote_url = f"http://{server_info['tailscale_ip']}:{server_info.get('port', '3006')}"
-        draw.text((padding, y), "Remote:", fill='black', font=normal_font)
-        y += 22
-        draw.text((padding + 15, y), remote_url, fill='black', font=small_font)
-        y += 25
-    
-    y += 10
-    draw.line([(padding, y), (width - padding, y)], fill='black', width=2)
-    y += 25
-    
-    # Boot timestamp
-    boot_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    draw.text((padding, y), "Boot Time:", fill='black', font=normal_font)
-    draw.text((padding + 140, y), boot_time, fill='black', font=normal_font)
-    y += 35
     
     # Closing message
+    y += 10
     draw.line([(padding, y), (width - padding, y)], fill='black', width=2)
     y += 25
     
-    closing = "System recovered successfully!"
-    bbox = draw.textbbox((0, 0), closing, font=normal_font)
-    closing_width = bbox[2] - bbox[0]
-    draw.text(((width - closing_width) // 2, y), closing, fill='black', font=normal_font)
+    # Success message (same as test print)
+    success_message = "System recovered successfully!"
+    bbox = draw.textbbox((0, 0), success_message, font=normal_font)
+    line_width = bbox[2] - bbox[0]
+    draw.text(((width - line_width) // 2, y), success_message, fill='black', font=normal_font)
+    y += 25
+    
+    ready_message = "Ready to receive print jobs."
+    bbox = draw.textbbox((0, 0), ready_message, font=normal_font)
+    line_width = bbox[2] - bbox[0]
+    draw.text(((width - line_width) // 2, y), ready_message, fill='black', font=normal_font)
     y += 30
     
-    closing2 = "Ready to receive print jobs."
-    bbox = draw.textbbox((0, 0), closing2, font=small_font)
-    closing2_width = bbox[2] - bbox[0]
-    draw.text(((width - closing2_width) // 2, y), closing2, fill='black', font=small_font)
-    y += 35
-    
-    # Crop to actual content
-    img = img.crop((0, 0, width, y + 20))
+    # Crop to actual content height
+    img = img.crop((0, 0, width, y + 30))
     
     return img
 
@@ -336,40 +322,51 @@ def print_receipt(printer_name, image_path, script_dir):
         return False
 
 
-def wait_for_cups(max_wait=60):
-    """Wait for CUPS service to be ready"""
+def wait_for_cups():
+    """Wait for CUPS service to be ready - keeps trying until success"""
     print("Waiting for CUPS service...")
     start_time = time.time()
+    attempt = 0
     
-    while time.time() - start_time < max_wait:
+    while True:  # Keep trying forever until CUPS is ready
+        attempt += 1
         try:
             result = subprocess.run(['lpstat', '-r'], capture_output=True, text=True, timeout=5)
             if 'scheduler is running' in result.stdout.lower():
-                print("CUPS is ready!")
+                elapsed = int(time.time() - start_time)
+                print(f"CUPS is ready! (took {elapsed} seconds, {attempt} attempts)")
                 return True
         except:
             pass
         
-        time.sleep(2)
-    
-    print("Warning: CUPS may not be fully ready")
-    return False
+        # Show progress every 30 seconds
+        elapsed = int(time.time() - start_time)
+        if elapsed > 0 and elapsed % 30 == 0:
+            print(f"  Still waiting for CUPS... ({elapsed}s, attempt #{attempt})")
+        
+        time.sleep(5)
 
 
-def wait_for_network(max_wait=60):
-    """Wait for network to be ready"""
+def wait_for_network():
+    """Wait for network to be ready - keeps trying until success"""
     print("Waiting for network...")
     start_time = time.time()
+    attempt = 0
     
-    while time.time() - start_time < max_wait:
+    while True:  # Keep trying forever until network is ready
+        attempt += 1
         ip = get_local_ip()
         if ip and ip != "Unknown":
-            print(f"Network ready! IP: {ip}")
+            elapsed = int(time.time() - start_time)
+            print(f"Network ready! IP: {ip} (took {elapsed} seconds, {attempt} attempts)")
             return True
-        time.sleep(2)
-    
-    print("Warning: Network may not be fully ready")
-    return False
+        
+        # Show progress every 30 seconds
+        elapsed = int(time.time() - start_time)
+        if elapsed > 0 and elapsed % 30 == 0:
+            print(f"  Still waiting for network... ({elapsed}s, attempt #{attempt})")
+        
+        time.sleep(5)
 
 
 def main():
@@ -388,9 +385,9 @@ def main():
     if os.path.exists(install_dir):
         script_dir = install_dir
     
-    # Wait for services to be ready
-    wait_for_network(max_wait=60)
-    wait_for_cups(max_wait=60)
+    # Wait for services to be ready (keeps trying until success)
+    wait_for_network()
+    wait_for_cups()
     
     # Give a bit more time for everything to stabilize
     print("Waiting 5 seconds for system to stabilize...")
@@ -402,7 +399,8 @@ def main():
         'local_ip': get_local_ip(),
         'tailscale_ip': get_tailscale_ip(),
         'port': os.environ.get('SERVER_PORT', '3006'),
-        'uptime': get_system_uptime()
+        'uptime': get_system_uptime(),
+        'install_dir': script_dir
     }
     
     print(f"\nServer Info:")
@@ -410,6 +408,7 @@ def main():
     print(f"  Local IP: {server_info['local_ip']}")
     print(f"  Tailscale IP: {server_info['tailscale_ip'] or 'Not connected'}")
     print(f"  Uptime: {server_info['uptime']}")
+    print(f"  Install Dir: {server_info['install_dir']}")
     
     # Get configured printers
     printers = get_configured_printers()
