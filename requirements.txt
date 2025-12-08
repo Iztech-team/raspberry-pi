@@ -7,3 +7,4 @@ Pillow>=8.0.0
 numpy>=1.19.0
 python-dotenv>=0.19.0
 python-escpos>=3.1
+pycups>=2.0.1
