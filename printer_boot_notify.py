@@ -362,17 +362,17 @@ def print_receipt(printer_name, image_path, script_dir):
         stdout, stderr = print_proc.communicate(timeout=30)
         
         if print_proc.returncode == 0:
-            # Send beep command (3 beeps)
-            time.sleep(0.5)
-            beep_cmd = ['lp', '-d', printer_name, '-o', 'raw']
-            beep_proc = subprocess.Popen(beep_cmd, stdin=subprocess.PIPE)
-            beep_proc.communicate(input=b'\x1b\x42\x03\x05', timeout=5)
-            
             # Send cut command
             time.sleep(0.5)
             cut_cmd = ['lp', '-d', printer_name, '-o', 'raw']
             cut_proc = subprocess.Popen(cut_cmd, stdin=subprocess.PIPE)
             cut_proc.communicate(input=b'\x1b\x64\x03\x1d\x56\x01', timeout=5)
+            
+            # Send beep command (3 beeps)
+            time.sleep(0.5)
+            beep_cmd = ['lp', '-d', printer_name, '-o', 'raw']
+            beep_proc = subprocess.Popen(beep_cmd, stdin=subprocess.PIPE)
+            beep_proc.communicate(input=b'\x1b\x42\x03\x05', timeout=5)
             
             return True
         else:

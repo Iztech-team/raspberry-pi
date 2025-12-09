@@ -902,15 +902,6 @@ EOF
             if $PYTHON_CMD "$SCRIPT_DIR/print_image_any.py" "$TEMP_IMAGE" --max-width 576 --mode gsv0 --align center 2>/dev/null | lp -d "$FIRST_PRINTER" -o raw 2>/dev/null; then
                 echo -e "${GREEN}    ✓ Successfully sent test print (image)${NC}"
                 
-                # Send beep command (3 beeps, 200ms each)
-                sleep 1
-                echo -e "${YELLOW}    ▸ Sending beep command...${NC}"
-                if echo -en "\x1b\x42\x03\x05" | lp -d "$FIRST_PRINTER" -o raw 2>/dev/null; then
-                    echo -e "${GREEN}    ✓ Beep command sent${NC}"
-                else
-                    echo -e "${YELLOW}    ⚠ Beep command sent but printer may not support it${NC}"
-                fi
-                
                 # Send cut command (feed 3 lines then partial cut)
                 sleep 1
                 echo -e "${YELLOW}    ▸ Sending cut command...${NC}"
@@ -918,6 +909,15 @@ EOF
                     echo -e "${GREEN}    ✓ Paper cut command sent${NC}"
                 else
                     echo -e "${YELLOW}    ⚠ Cut command sent but printer may not support it${NC}"
+                fi
+                
+                # Send beep command (3 beeps, 200ms each)
+                sleep 1
+                echo -e "${YELLOW}    ▸ Sending beep command...${NC}"
+                if echo -en "\x1b\x42\x03\x05" | lp -d "$FIRST_PRINTER" -o raw 2>/dev/null; then
+                    echo -e "${GREEN}    ✓ Beep command sent${NC}"
+                else
+                    echo -e "${YELLOW}    ⚠ Beep command sent but printer may not support it${NC}"
                 fi
                 
                 WORKING_PRINTERS=$((WORKING_PRINTERS + 1))
