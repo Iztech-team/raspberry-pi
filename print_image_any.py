@@ -15,28 +15,37 @@ def floyd_steinberg_dithering(img_array):
     """
     Apply Floyd-Steinberg dithering to simulate grayscale
     This makes images look much better on thermal printers
+    Optimized version using numpy for better performance
     """
     height, width = img_array.shape
-    output = img_array.copy().astype(float)
+    output = img_array.copy().astype(np.float32)
+    
+    # Pre-compute error distribution coefficients
+    e7_16 = 7.0 / 16.0
+    e3_16 = 3.0 / 16.0
+    e5_16 = 5.0 / 16.0
+    e1_16 = 1.0 / 16.0
     
     for y in range(height):
+        row = output[y]
         for x in range(width):
-            old_pixel = output[y, x]
-            new_pixel = 255 if old_pixel > 128 else 0
-            output[y, x] = new_pixel
+            old_pixel = row[x]
+            new_pixel = 255.0 if old_pixel > 128.0 else 0.0
+            row[x] = new_pixel
             error = old_pixel - new_pixel
             
             # Distribute error to neighboring pixels
             if x + 1 < width:
-                output[y, x + 1] += error * 7 / 16
+                row[x + 1] += error * e7_16
             if y + 1 < height:
+                next_row = output[y + 1]
                 if x > 0:
-                    output[y + 1, x - 1] += error * 3 / 16
-                output[y + 1, x] += error * 5 / 16
+                    next_row[x - 1] += error * e3_16
+                next_row[x] += error * e5_16
                 if x + 1 < width:
-                    output[y + 1, x + 1] += error * 1 / 16
+                    next_row[x + 1] += error * e1_16
     
-    return output.astype(np.uint8)
+    return np.clip(output, 0, 255).astype(np.uint8)
 
 
 def convert_to_bitmap(image, max_width=576, invert=False, align="center", mode="gsv0", dither=True):
