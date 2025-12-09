@@ -329,8 +329,8 @@ echo -e "${YELLOW}▸ Installing printer boot notification service...${NC}"
 cat > printer-boot-notify.service << EOF
 [Unit]
 Description=Printer Boot Notification - Prints status to all printers on boot
-After=network.target cups.service printer-server.service
-Wants=cups.service
+After=network-online.target cups.service printer-server.service
+Wants=network-online.target cups.service
 StartLimitIntervalSec=0
 
 [Service]
@@ -340,7 +340,12 @@ WorkingDirectory=$INSTALL_DIR
 Environment="SERVER_PORT=$SERVER_PORT"
 Environment="HOME=$HOME"
 Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-ExecStartPre=/bin/sleep 10
+# Wait for printers to boot (30s default, adjust via PRINTER_BOOT_DELAY)
+Environment="PRINTER_BOOT_DELAY=30"
+# Retry failed prints (3 attempts with 10s delay)
+Environment="PRINT_MAX_RETRIES=3"
+Environment="PRINT_RETRY_DELAY=10"
+ExecStartPre=/bin/sleep 15
 ExecStart=$INSTALL_DIR/venv/bin/python $INSTALL_DIR/printer_boot_notify.py
 TimeoutStartSec=infinity
 StandardOutput=journal

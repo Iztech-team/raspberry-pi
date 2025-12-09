@@ -92,9 +92,70 @@ def get_configured_printers():
         return []
 
 
+def scan_network_for_printers():
+    """
+    Actively scan the network for printers on port 9100.
+    This is more reliable than passive mDNS discovery after boot.
+    Returns list of discovered socket:// URIs.
+    """
+    discovered = []
+    try:
+        # Get local IP and subnet
+        local_ip = get_local_ip()
+        if not local_ip or local_ip == "Unknown":
+            print("  Cannot determine local IP for network scan")
+            return discovered
+        
+        subnet = '.'.join(local_ip.split('.')[:3])
+        print(f"  Scanning subnet {subnet}.0/24 for printers on port 9100...")
+        
+        # Try nmap first (faster and more reliable)
+        if subprocess.run(['which', 'nmap'], capture_output=True).returncode == 0:
+            print("  Using nmap for fast scanning...")
+            result = subprocess.run(
+                ['nmap', '-p', '9100', '--open', '-T4', '--host-timeout', '10s', f'{subnet}.0/24'],
+                capture_output=True, text=True, timeout=120
+            )
+            # Parse nmap output for IPs with open port 9100
+            current_ip = None
+            for line in result.stdout.splitlines():
+                if 'Nmap scan report for' in line:
+                    # Extract IP from line like "Nmap scan report for 192.168.1.100"
+                    parts = line.split()
+                    current_ip = parts[-1].strip('()')
+                elif '9100/tcp' in line and 'open' in line and current_ip:
+                    discovered.append(f"socket://{current_ip}:9100")
+                    current_ip = None
+        else:
+            # Fallback: manual scan with longer timeout
+            print("  Using manual scan (nmap not available, this may take a while)...")
+            import socket as sock
+            for i in range(1, 255):
+                ip = f"{subnet}.{i}"
+                try:
+                    s = sock.socket(sock.AF_INET, sock.SOCK_STREAM)
+                    s.settimeout(1)  # 1 second timeout per host
+                    if s.connect_ex((ip, 9100)) == 0:
+                        discovered.append(f"socket://{ip}:9100")
+                        print(f"    Found printer at {ip}:9100")
+                    s.close()
+                except:
+                    pass
+        
+        print(f"  Network scan found {len(discovered)} printer(s)")
+        
+    except subprocess.TimeoutExpired:
+        print("  Network scan timed out")
+    except Exception as e:
+        print(f"  Network scan error: {e}")
+    
+    return discovered
+
+
 def discover_and_add_printers():
     """
     Discover network printers and add any new ones to CUPS.
+    Uses both passive (lpinfo) and active (nmap) discovery.
     Idempotent: skips URIs that are already configured.
     """
     try:
@@ -114,16 +175,28 @@ def discover_and_add_printers():
         for line in existing_uri_output.splitlines():
             if ': ' in line:
                 existing_uris.add(line.split(': ', 1)[1].strip())
-
-        # Discover network printers (socket:// or other network transports)
+        
+        print(f"  Currently {len(existing_names)} printer(s) configured")
+        
+        discovered_uris = set()
+        
+        # Method 1: Passive discovery via CUPS/lpinfo (mDNS/Bonjour)
+        print("  Trying passive discovery (lpinfo)...")
         lpinfo_out = subprocess.run(
             ['lpinfo', '-v'], capture_output=True, text=True
         ).stdout.splitlines()
-        discovered_uris = [
-            line.split(None, 1)[1].strip()
-            for line in lpinfo_out
-            if 'socket://' in line.lower() or 'network' in line.lower()
-        ]
+        for line in lpinfo_out:
+            if 'socket://' in line.lower():
+                parts = line.split(None, 1)
+                if len(parts) >= 2:
+                    discovered_uris.add(parts[1].strip())
+        
+        # Method 2: Active network scan (more reliable after boot)
+        print("  Trying active network scan...")
+        network_uris = scan_network_for_printers()
+        discovered_uris.update(network_uris)
+        
+        print(f"  Total discovered URIs: {len(discovered_uris)}")
 
         # Find next printer_N index
         next_idx = 1
@@ -137,6 +210,7 @@ def discover_and_add_printers():
         new_printers = []
         for uri in discovered_uris:
             if uri in existing_uris:
+                print(f"    Skipping {uri} (already configured)")
                 continue
             name = f"printer_{next_idx}"
             next_idx += 1
@@ -145,11 +219,12 @@ def discover_and_add_printers():
             result = subprocess.run(add_cmd, capture_output=True, text=True)
             if result.returncode == 0:
                 new_printers.append((name, uri))
+                print(f"    ✓ Added {name}")
             else:
-                print(f"    Failed to add {name}: {result.stderr.strip()}")
+                print(f"    ✗ Failed to add {name}: {result.stderr.strip()}")
 
         if new_printers:
-            print(f"Discovered and added {len(new_printers)} printer(s).")
+            print(f"Discovered and added {len(new_printers)} new printer(s).")
         else:
             print("No new printers discovered.")
 
@@ -515,9 +590,16 @@ def main():
     # Wait for services to be ready (keeps trying until success)
     wait_for_network()
     wait_for_cups()
+    
+    # Wait for network printers to boot up after power outage
+    # Printers typically take 30-60 seconds to fully boot and become network-accessible
+    printer_boot_delay = int(os.environ.get('PRINTER_BOOT_DELAY', '30'))
+    print(f"\nWaiting {printer_boot_delay}s for network printers to boot up...")
+    print("  (Set PRINTER_BOOT_DELAY env var to adjust)")
+    time.sleep(printer_boot_delay)
 
-    # Discover and add new printers (idempotent)
-    print("\nDiscovering and adding new printers (if any)...")
+    # Discover and add new printers (uses both passive and active scanning)
+    print("\nDiscovering and adding new printers...")
     discover_and_add_printers()
     
     # Give a bit more time for everything to stabilize
@@ -570,6 +652,9 @@ def main():
     success_count = 0
     fail_count = 0
     
+    max_retries = int(os.environ.get('PRINT_MAX_RETRIES', '3'))
+    retry_delay = int(os.environ.get('PRINT_RETRY_DELAY', '10'))
+    
     for printer in printers:
         print(f"\nProcessing: {printer['name']}")
         
@@ -582,12 +667,22 @@ def main():
             img.save(temp_image)
             print(f"  Generated receipt image: {temp_image}")
             
-            # Print it
-            if print_receipt(printer['name'], temp_image, script_dir):
-                print(f"  SUCCESS: Boot notification sent to {printer['name']}")
-                success_count += 1
-            else:
-                print(f"  FAILED: Could not send to {printer['name']}")
+            # Print with retry logic (printers may still be booting)
+            printed = False
+            for attempt in range(1, max_retries + 1):
+                print(f"  Attempt {attempt}/{max_retries}...")
+                if print_receipt(printer['name'], temp_image, script_dir):
+                    print(f"  ✓ SUCCESS: Boot notification sent to {printer['name']}")
+                    success_count += 1
+                    printed = True
+                    break
+                else:
+                    if attempt < max_retries:
+                        print(f"  ⚠ Failed, retrying in {retry_delay}s...")
+                        time.sleep(retry_delay)
+            
+            if not printed:
+                print(f"  ✗ FAILED: Could not send to {printer['name']} after {max_retries} attempts")
                 fail_count += 1
             
             # Clean up temp file
