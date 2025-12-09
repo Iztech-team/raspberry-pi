@@ -43,7 +43,8 @@ SERVER_PORT="${SERVER_PORT:-3006}"
 LOGO_FILENAME="${LOGO_FILENAME:-BarakaOS_Logo.png}"
 
 # Default Tailscale auth key (can be overridden in .env)
-TAILSCALE_AUTH_KEY="${TAILSCALE_AUTH_KEY:-tskey-auth-kaKN9Px7tt11CNTRL-gmTQvX6vkuPWhYRhGoz2uPtLHYsB34qrJ}"
+# Get a fresh key from: https://login.tailscale.com/admin/settings/keys
+TAILSCALE_AUTH_KEY="${TAILSCALE_AUTH_KEY:-tskey-auth-kovsU194NA21CNTRL-64rjKieK3W7NZacGRiCUV7E7eNxhyqSQ}"
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # AUTHENTICATION SETUP (for private repos)
@@ -87,7 +88,7 @@ echo -e "${GREEN}✓ System updated${NC}"
 echo ""
 echo -e "${YELLOW}[2/8] Installing CUPS and dependencies...${NC}"
 # libcups2-dev is required to build pycups wheels
-sudo apt install -y cups cups-client libcups2-dev git python3 python3-pip python3-venv python3-dev build-essential lsof fonts-dejavu fonts-dejavu-core
+sudo apt install -y cups cups-client libcups2-dev git python3 python3-pip python3-venv python3-dev build-essential lsof fonts-dejavu fonts-dejavu-core nmap
 echo -e "${GREEN}✓ CUPS installed${NC}"
 
 # Start and enable CUPS service
@@ -398,6 +399,9 @@ fi
 # TAILSCALE SETUP FOR REMOTE ACCESS (before printer testing)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+# Disable exit-on-error for Tailscale section (non-critical, should not stop script)
+set +e
+
 echo ""
 echo -e "${YELLOW}▸ Setting up Tailscale for remote access...${NC}"
 
@@ -419,20 +423,20 @@ if command -v tailscale &> /dev/null; then
             # Try to connect if auth key exists (prioritize .env)
             if [ ! -z "$TAILSCALE_AUTH_KEY" ]; then
                 echo -e "${YELLOW}  Connecting to Tailscale with auth key from .env...${NC}"
-                sudo tailscale up --authkey="$TAILSCALE_AUTH_KEY" --accept-routes > /dev/null 2>&1
+                timeout 30 sudo tailscale up --authkey="$TAILSCALE_AUTH_KEY" --accept-routes 2>&1 || echo -e "${YELLOW}    (timeout or connection issue)${NC}"
                 
                 TAILSCALE_IP=$(tailscale ip -4 2>/dev/null || true)
                 if [ ! -z "$TAILSCALE_IP" ]; then
                     echo -e "${GREEN}  ✓ Tailscale connected successfully!${NC}"
                     echo -e "${CYAN}    Tailscale IP: ${GREEN}${BOLD}$TAILSCALE_IP${NC}"
                 else
-                    echo -e "${RED}  ✗ Failed to connect to Tailscale${NC}"
-                    echo -e "${YELLOW}    Auth key may be invalid or expired${NC}"
+                    echo -e "${YELLOW}  ⚠ Could not connect to Tailscale (continuing anyway)${NC}"
+                    echo -e "${YELLOW}    Auth key may be invalid/expired. Run 'sudo tailscale up' manually later.${NC}"
                 fi
             elif [ -f "$TAILSCALE_AUTH_KEY_FILE" ]; then
                 echo -e "${YELLOW}  Connecting to Tailscale with auth key from file...${NC}"
                 TS_KEY=$(cat "$TAILSCALE_AUTH_KEY_FILE")
-                sudo tailscale up --authkey="$TS_KEY" --accept-routes > /dev/null 2>&1
+                timeout 30 sudo tailscale up --authkey="$TS_KEY" --accept-routes 2>&1 || echo -e "${YELLOW}    (timeout or connection issue)${NC}"
                 
                 # Delete the key file after use for security
                 rm -f "$TAILSCALE_AUTH_KEY_FILE"
@@ -443,8 +447,8 @@ if command -v tailscale &> /dev/null; then
                     echo -e "${GREEN}  ✓ Tailscale connected successfully!${NC}"
                     echo -e "${CYAN}    Tailscale IP: ${GREEN}${BOLD}$TAILSCALE_IP${NC}"
                 else
-                    echo -e "${RED}  ✗ Failed to connect to Tailscale${NC}"
-                    echo -e "${YELLOW}    Auth key may be invalid or expired${NC}"
+                    echo -e "${YELLOW}  ⚠ Could not connect to Tailscale (continuing anyway)${NC}"
+                    echo -e "${YELLOW}    Auth key may be invalid/expired. Run 'sudo tailscale up' manually later.${NC}"
                 fi
             else
                 echo -e "${YELLOW}  ⚠ Tailscale installed but not connected${NC}"
@@ -454,20 +458,20 @@ if command -v tailscale &> /dev/null; then
         # Try to connect if auth key exists (prioritize .env)
         if [ ! -z "$TAILSCALE_AUTH_KEY" ]; then
             echo -e "${YELLOW}  Connecting to Tailscale with auth key from .env...${NC}"
-            sudo tailscale up --authkey="$TAILSCALE_AUTH_KEY" --accept-routes > /dev/null 2>&1
+            timeout 30 sudo tailscale up --authkey="$TAILSCALE_AUTH_KEY" --accept-routes 2>&1 || echo -e "${YELLOW}    (timeout or connection issue)${NC}"
             
             TAILSCALE_IP=$(tailscale ip -4 2>/dev/null || true)
             if [ ! -z "$TAILSCALE_IP" ]; then
                 echo -e "${GREEN}  ✓ Tailscale connected successfully!${NC}"
                 echo -e "${CYAN}    Tailscale IP: ${GREEN}${BOLD}$TAILSCALE_IP${NC}"
             else
-                echo -e "${RED}  ✗ Failed to connect to Tailscale${NC}"
-                echo -e "${YELLOW}    Auth key may be invalid or expired${NC}"
+                echo -e "${YELLOW}  ⚠ Could not connect to Tailscale (continuing anyway)${NC}"
+                echo -e "${YELLOW}    Auth key may be invalid/expired. Run 'sudo tailscale up' manually later.${NC}"
             fi
         elif [ -f "$TAILSCALE_AUTH_KEY_FILE" ]; then
             echo -e "${YELLOW}  Connecting to Tailscale with auth key from file...${NC}"
             TS_KEY=$(cat "$TAILSCALE_AUTH_KEY_FILE")
-            sudo tailscale up --authkey="$TS_KEY" --accept-routes > /dev/null 2>&1
+            timeout 30 sudo tailscale up --authkey="$TS_KEY" --accept-routes 2>&1 || echo -e "${YELLOW}    (timeout or connection issue)${NC}"
             
             # Delete the key file after use for security
             rm -f "$TAILSCALE_AUTH_KEY_FILE"
@@ -478,8 +482,8 @@ if command -v tailscale &> /dev/null; then
                 echo -e "${GREEN}  ✓ Tailscale connected successfully!${NC}"
                 echo -e "${CYAN}    Tailscale IP: ${GREEN}${BOLD}$TAILSCALE_IP${NC}"
             else
-                echo -e "${RED}  ✗ Failed to connect to Tailscale${NC}"
-                echo -e "${YELLOW}    Auth key may be invalid or expired${NC}"
+                echo -e "${YELLOW}  ⚠ Could not connect to Tailscale (continuing anyway)${NC}"
+                echo -e "${YELLOW}    Auth key may be invalid/expired. Run 'sudo tailscale up' manually later.${NC}"
             fi
         else
             echo -e "${YELLOW}  ⚠ Tailscale installed but not connected${NC}"
@@ -507,20 +511,20 @@ else
         # Try to connect automatically if auth key exists (prioritize .env)
         if [ ! -z "$TAILSCALE_AUTH_KEY" ]; then
             echo -e "${YELLOW}  Connecting to Tailscale with auth key from .env...${NC}"
-            sudo tailscale up --authkey="$TAILSCALE_AUTH_KEY" --accept-routes > /dev/null 2>&1
+            timeout 30 sudo tailscale up --authkey="$TAILSCALE_AUTH_KEY" --accept-routes 2>&1 || echo -e "${YELLOW}    (timeout or connection issue)${NC}"
             
             TAILSCALE_IP=$(tailscale ip -4 2>/dev/null || true)
             if [ ! -z "$TAILSCALE_IP" ]; then
                 echo -e "${GREEN}  ✓ Tailscale connected successfully!${NC}"
                 echo -e "${CYAN}    Tailscale IP: ${GREEN}${BOLD}$TAILSCALE_IP${NC}"
             else
-                echo -e "${RED}  ✗ Failed to connect to Tailscale${NC}"
-                echo -e "${YELLOW}    Auth key may be invalid or expired${NC}"
+                echo -e "${YELLOW}  ⚠ Could not connect to Tailscale (continuing anyway)${NC}"
+                echo -e "${YELLOW}    Auth key may be invalid/expired. Run 'sudo tailscale up' manually later.${NC}"
             fi
         elif [ -f "$TAILSCALE_AUTH_KEY_FILE" ]; then
             echo -e "${YELLOW}  Connecting to Tailscale with auth key from file...${NC}"
             TS_KEY=$(cat "$TAILSCALE_AUTH_KEY_FILE")
-            sudo tailscale up --authkey="$TS_KEY" --accept-routes > /dev/null 2>&1
+            timeout 30 sudo tailscale up --authkey="$TS_KEY" --accept-routes 2>&1 || echo -e "${YELLOW}    (timeout or connection issue)${NC}"
             
             # Delete the key file after use for security
             rm -f "$TAILSCALE_AUTH_KEY_FILE"
@@ -531,8 +535,8 @@ else
                 echo -e "${GREEN}  ✓ Tailscale connected successfully!${NC}"
                 echo -e "${CYAN}    Tailscale IP: ${GREEN}${BOLD}$TAILSCALE_IP${NC}"
             else
-                echo -e "${RED}  ✗ Failed to connect to Tailscale${NC}"
-                echo -e "${YELLOW}    Auth key may be invalid or expired${NC}"
+                echo -e "${YELLOW}  ⚠ Could not connect to Tailscale (continuing anyway)${NC}"
+                echo -e "${YELLOW}    Auth key may be invalid/expired. Run 'sudo tailscale up' manually later.${NC}"
             fi
         else
             # Show instructions for getting an auth key
@@ -555,6 +559,9 @@ else
         echo -e "${CYAN}    curl -fsSL https://tailscale.com/install.sh | sh${NC}"
     fi
 fi
+
+# Re-enable exit-on-error after Tailscale section
+set -e
 
 echo ""
 
@@ -587,8 +594,9 @@ echo -e "${CYAN}  Next printer number will be: printer_$NEXT_PRINTER_NUM${NC}"
 # Quick scan using nmap if available, otherwise use nc
 if command -v nmap &> /dev/null; then
     echo -e "${CYAN}  Using nmap for fast scanning...${NC}"
-    # Scan for common printer ports
-    SCAN_RESULTS=$(sudo nmap -p 9100,515,631 --open "$SUBNET.0/24" 2>/dev/null | grep -B 4 "open" | grep "Nmap scan report" | awk '{print $NF}' | tr -d '()')
+    # Scan for common printer ports with increased timeout for slow printers
+    # -T4 = aggressive timing, --host-timeout 30s = max 30s per host
+    SCAN_RESULTS=$(sudo nmap -p 9100,515,631 --open -T4 --host-timeout 30s "$SUBNET.0/24" 2>/dev/null | grep -B 4 "open" | grep "Nmap scan report" | awk '{print $NF}' | tr -d '()')
 else
     echo -e "${CYAN}  Using basic network scan (installing nmap recommended for faster scans)...${NC}"
     # Fallback: scan common IPs with netcat
@@ -596,7 +604,8 @@ else
     for i in {1..254}; do
         IP="$SUBNET.$i"
         # Quick check on port 9100 (most common for network printers)
-        if timeout 0.2 bash -c "echo > /dev/tcp/$IP/9100" 2>/dev/null; then
+        # Use 1 second timeout - network printers can be slow to respond
+        if timeout 1 bash -c "echo > /dev/tcp/$IP/9100" 2>/dev/null; then
             SCAN_RESULTS="$SCAN_RESULTS$IP\n"
         fi
     done
@@ -737,8 +746,9 @@ import textwrap
 import os
 
 # Create image (576px width for 80mm thermal printer)
+# Reduced height for faster printing
 width = 576
-height = 1600
+height = 800
 img = Image.new('RGB', (width, height), 'white')
 draw = ImageDraw.Draw(img)
 
@@ -898,35 +908,60 @@ EOF
 
         # Check if image was created successfully
         if [ -f "$TEMP_IMAGE" ]; then
-            # Use the print_image_any.py script from USB to send the image
-            if $PYTHON_CMD "$SCRIPT_DIR/print_image_any.py" "$TEMP_IMAGE" --max-width 576 --mode gsv0 --align center 2>/dev/null | lp -d "$FIRST_PRINTER" -o raw 2>/dev/null; then
-                echo -e "${GREEN}    ✓ Successfully sent test print (image)${NC}"
-                
-                # Send cut command (feed 3 lines then partial cut)
-                sleep 1
-                echo -e "${YELLOW}    ▸ Sending cut command...${NC}"
-                if echo -en "\x1b\x64\x03\x1d\x56\x01" | lp -d "$FIRST_PRINTER" -o raw 2>/dev/null; then
-                    echo -e "${GREEN}    ✓ Paper cut command sent${NC}"
+            # Use python-escpos (C-optimized, much faster than print_image_any.py)
+            # Generate ESC/POS commands and pipe directly to printer via lp
+            TEMP_ESCPOS="/tmp/escpos_$(date +%s)_${RANDOM}.bin"
+            
+            if $PYTHON_CMD << ESCPOS_EOF
+import sys
+from escpos.printer import Dummy
+from PIL import Image
+
+# Create dummy printer to capture ESC/POS output
+p = Dummy()
+
+# Center align
+p.set(align='center')
+
+# Print image - python-escpos uses fast C-optimized PIL dithering
+p.image("$TEMP_IMAGE")
+
+# Reset alignment
+p.set(align='left')
+
+# Feed lines
+p.text('\n\n\n')
+
+# Cut paper
+p.cut()
+
+# Beep (3 beeps, 500ms each)
+p._raw(b'\x1b\x42\x03\x05')
+
+# Write raw ESC/POS bytes to file
+with open("$TEMP_ESCPOS", 'wb') as f:
+    f.write(p.output)
+
+print("ESC/POS generated successfully")
+ESCPOS_EOF
+            then
+                # Send the generated ESC/POS data to printer
+                if lp -d "$FIRST_PRINTER" -o raw "$TEMP_ESCPOS" 2>/dev/null; then
+                    echo -e "${GREEN}    ✓ Successfully sent test print (python-escpos)${NC}"
+                    WORKING_PRINTERS=$((WORKING_PRINTERS + 1))
                 else
-                    echo -e "${YELLOW}    ⚠ Cut command sent but printer may not support it${NC}"
+                    echo -e "${RED}    ✗ Failed to send to printer${NC}"
+                    FAILED_PRINTERS=$((FAILED_PRINTERS + 1))
                 fi
-                
-                # Send beep command (3 beeps, 200ms each)
-                sleep 1
-                echo -e "${YELLOW}    ▸ Sending beep command...${NC}"
-                if echo -en "\x1b\x42\x03\x05" | lp -d "$FIRST_PRINTER" -o raw 2>/dev/null; then
-                    echo -e "${GREEN}    ✓ Beep command sent${NC}"
-                else
-                    echo -e "${YELLOW}    ⚠ Beep command sent but printer may not support it${NC}"
-                fi
-                
-                WORKING_PRINTERS=$((WORKING_PRINTERS + 1))
             else
-                echo -e "${RED}    ✗ Failed to send test print${NC}"
+                echo -e "${RED}    ✗ Failed to generate ESC/POS data${NC}"
                 FAILED_PRINTERS=$((FAILED_PRINTERS + 1))
             fi
-            # Clean up temp image
-            rm -f "$TEMP_IMAGE"
+            
+            # Clean up temp files
+            rm -f "$TEMP_IMAGE" "$TEMP_ESCPOS"
+            # Small delay between printers to prevent network congestion
+            sleep 2
         else
             echo -e "${RED}    ✗ Failed to generate test image${NC}"
             FAILED_PRINTERS=$((FAILED_PRINTERS + 1))

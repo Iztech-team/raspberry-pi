@@ -335,9 +335,70 @@ def generate_boot_receipt(printer_info, server_info, logo_path=None):
 
 
 def print_receipt(printer_name, image_path, script_dir):
-    """Print the receipt image to a specific printer"""
+    """Print the receipt image to a specific printer using python-escpos (fast C-optimized)"""
     try:
-        # Use print_image_any.py to convert and print
+        # Use python-escpos directly - much faster than print_image_any.py
+        # python-escpos uses PIL's C-optimized dithering
+        from escpos.printer import Dummy
+        from PIL import Image
+        import tempfile
+        
+        # Create dummy printer to capture ESC/POS output
+        p = Dummy()
+        
+        # Center align
+        p.set(align='center')
+        
+        # Print image - python-escpos uses fast C-optimized PIL dithering
+        p.image(image_path)
+        
+        # Reset alignment
+        p.set(align='left')
+        
+        # Feed lines before cut
+        p.text('\n\n\n')
+        
+        # Cut paper
+        p.cut()
+        
+        # Beep (3 beeps, 500ms each)
+        p._raw(b'\x1b\x42\x03\x05')
+        
+        # Write ESC/POS data to temp file and print via lp
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.bin') as tmp:
+            tmp.write(p.output)
+            tmp_path = tmp.name
+        
+        try:
+            print_cmd = ['lp', '-d', printer_name, '-o', 'raw', tmp_path]
+            result = subprocess.run(print_cmd, capture_output=True, timeout=30)
+            
+            if result.returncode == 0:
+                return True
+            else:
+                print(f"  Print command failed: {result.stderr.decode()}")
+                return False
+        finally:
+            # Clean up temp file
+            try:
+                os.remove(tmp_path)
+            except:
+                pass
+            
+    except subprocess.TimeoutExpired:
+        print(f"  Print timeout for {printer_name}")
+        return False
+    except ImportError:
+        print(f"  Warning: python-escpos not installed, falling back to print_image_any.py")
+        return print_receipt_fallback(printer_name, image_path, script_dir)
+    except Exception as e:
+        print(f"  Error printing to {printer_name}: {e}")
+        return False
+
+
+def print_receipt_fallback(printer_name, image_path, script_dir):
+    """Fallback to print_image_any.py if python-escpos is not available"""
+    try:
         print_script = os.path.join(script_dir, 'print_image_any.py')
         
         if not os.path.exists(print_script):
@@ -349,7 +410,8 @@ def print_receipt(printer_name, image_path, script_dir):
             sys.executable, print_script, image_path,
             '--max-width', '576',
             '--mode', 'gsv0',
-            '--align', 'center'
+            '--align', 'center',
+            '--no-dither'  # Skip dithering for speed
         ]
         
         print_cmd = ['lp', '-d', printer_name, '-o', 'raw']
@@ -442,7 +504,7 @@ def main():
     print(f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print()
     
-    # Determine script directory (for finding print_image_any.py and logo)
+    # Determine script directory (for finding logo and fallback scripts)
     script_dir = os.path.dirname(os.path.abspath(__file__))
     
     # Also check the installation directory
