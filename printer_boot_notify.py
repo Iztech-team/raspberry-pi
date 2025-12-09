@@ -92,6 +92,71 @@ def get_configured_printers():
         return []
 
 
+def discover_and_add_printers():
+    """
+    Discover network printers and add any new ones to CUPS.
+    Idempotent: skips URIs that are already configured.
+    """
+    try:
+        # Existing printers and URIs
+        existing_printers = subprocess.run(
+            ['lpstat', '-p'], capture_output=True, text=True
+        ).stdout
+        existing_names = [
+            line.split()[1] for line in existing_printers.splitlines()
+            if line.startswith('printer ')
+        ]
+
+        existing_uri_output = subprocess.run(
+            ['lpstat', '-v'], capture_output=True, text=True
+        ).stdout
+        existing_uris = set()
+        for line in existing_uri_output.splitlines():
+            if ': ' in line:
+                existing_uris.add(line.split(': ', 1)[1].strip())
+
+        # Discover network printers (socket:// or other network transports)
+        lpinfo_out = subprocess.run(
+            ['lpinfo', '-v'], capture_output=True, text=True
+        ).stdout.splitlines()
+        discovered_uris = [
+            line.split(None, 1)[1].strip()
+            for line in lpinfo_out
+            if 'socket://' in line.lower() or 'network' in line.lower()
+        ]
+
+        # Find next printer_N index
+        next_idx = 1
+        numbered = [n for n in existing_names if n.startswith('printer_')]
+        if numbered:
+            try:
+                next_idx = max(int(n.split('_')[1]) for n in numbered) + 1
+            except Exception:
+                pass
+
+        new_printers = []
+        for uri in discovered_uris:
+            if uri in existing_uris:
+                continue
+            name = f"printer_{next_idx}"
+            next_idx += 1
+            print(f"  Adding new printer {name} -> {uri}")
+            add_cmd = ['lpadmin', '-p', name, '-v', uri, '-E']
+            result = subprocess.run(add_cmd, capture_output=True, text=True)
+            if result.returncode == 0:
+                new_printers.append((name, uri))
+            else:
+                print(f"    Failed to add {name}: {result.stderr.strip()}")
+
+        if new_printers:
+            print(f"Discovered and added {len(new_printers)} printer(s).")
+        else:
+            print("No new printers discovered.")
+
+    except Exception as e:
+        print(f"Printer discovery error: {e}")
+
+
 def get_system_uptime():
     """Get system uptime"""
     try:
@@ -388,6 +453,10 @@ def main():
     # Wait for services to be ready (keeps trying until success)
     wait_for_network()
     wait_for_cups()
+
+    # Discover and add new printers (idempotent)
+    print("\nDiscovering and adding new printers (if any)...")
+    discover_and_add_printers()
     
     # Give a bit more time for everything to stabilize
     print("Waiting 5 seconds for system to stabilize...")
