@@ -341,7 +341,8 @@ async def print_image(
         if center:
             p.set(align='left')
         
-        # Feed lines before cutting (PREVENTS MID-IMAGE CUTTING!)
+        # Default one-line feed after image to avoid edge cuts, plus user-configured extra
+        p.text('\n')
         if lines_after > 0:
             p.text('\n' * lines_after)
         
