@@ -3,6 +3,11 @@
 Printer Boot Notification Script
 Prints a status receipt to all configured printers when the system boots up.
 This helps identify which printers are back online after a power outage.
+
+Features:
+- MAC-based printer identification (prevents duplicates when IPs change)
+- Active network scanning for printer discovery
+- Automatic IP updates for existing printers
 """
 
 import subprocess
@@ -10,6 +15,8 @@ import sys
 import os
 import socket
 import time
+import json
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -20,6 +27,229 @@ try:
 except ImportError:
     print("PIL not installed. Run: pip install Pillow")
     sys.exit(1)
+
+# ============== MAC ADDRESS REGISTRY ==============
+# This file stores the mapping of MAC addresses to printer names
+# to prevent duplicate printers when IPs change (DHCP)
+MAC_REGISTRY_PATH = "/etc/cups/printer_mac_registry.json"
+MAC_REGISTRY_FALLBACK_PATH = os.path.expanduser("~/printer-server/printer_mac_registry.json")
+
+
+def get_mac_registry_path():
+    """Get the path to the MAC registry file, creating directories if needed."""
+    # Try the primary path first (/etc/cups/)
+    if os.path.exists(os.path.dirname(MAC_REGISTRY_PATH)):
+        return MAC_REGISTRY_PATH
+    
+    # Fall back to user directory
+    fallback_dir = os.path.dirname(MAC_REGISTRY_FALLBACK_PATH)
+    os.makedirs(fallback_dir, exist_ok=True)
+    return MAC_REGISTRY_FALLBACK_PATH
+
+
+def load_mac_registry():
+    """Load the MAC address to printer name mapping from file."""
+    registry_path = get_mac_registry_path()
+    try:
+        if os.path.exists(registry_path):
+            with open(registry_path, 'r') as f:
+                data = json.load(f)
+                print(f"  Loaded MAC registry from {registry_path} ({len(data)} entries)")
+                return data
+    except Exception as e:
+        print(f"  Warning: Could not load MAC registry: {e}")
+    return {}
+
+
+def save_mac_registry(registry):
+    """Save the MAC address to printer name mapping to file."""
+    registry_path = get_mac_registry_path()
+    try:
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(registry_path), exist_ok=True)
+        
+        with open(registry_path, 'w') as f:
+            json.dump(registry, f, indent=2)
+        print(f"  Saved MAC registry to {registry_path} ({len(registry)} entries)")
+        return True
+    except PermissionError:
+        # Try fallback path if permission denied on /etc/cups
+        try:
+            fallback_dir = os.path.dirname(MAC_REGISTRY_FALLBACK_PATH)
+            os.makedirs(fallback_dir, exist_ok=True)
+            with open(MAC_REGISTRY_FALLBACK_PATH, 'w') as f:
+                json.dump(registry, f, indent=2)
+            print(f"  Saved MAC registry to {MAC_REGISTRY_FALLBACK_PATH} ({len(registry)} entries)")
+            return True
+        except Exception as e2:
+            print(f"  Error saving MAC registry: {e2}")
+            return False
+    except Exception as e:
+        print(f"  Error saving MAC registry: {e}")
+        return False
+
+
+def get_mac_address(ip):
+    """
+    Get the MAC address for a given IP address.
+    Uses ARP cache after ensuring the IP is in the cache (via ping).
+    Returns MAC address string (uppercase, colon-separated) or None if not found.
+    """
+    if not ip or ip == "unknown":
+        return None
+    
+    try:
+        # First, ping the IP to ensure it's in the ARP cache
+        # Use a short timeout and single packet
+        subprocess.run(
+            ['ping', '-c', '1', '-W', '2', ip],
+            capture_output=True, timeout=5
+        )
+        
+        # Small delay to let ARP cache update
+        time.sleep(0.5)
+        
+        # Method 1: Try 'ip neighbor' command (newer Linux systems)
+        try:
+            result = subprocess.run(
+                ['ip', 'neighbor', 'show', ip],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                # Output format: "192.168.1.100 dev eth0 lladdr aa:bb:cc:dd:ee:ff REACHABLE"
+                parts = result.stdout.strip().split()
+                for i, part in enumerate(parts):
+                    if part == 'lladdr' and i + 1 < len(parts):
+                        mac = parts[i + 1].upper()
+                        # Validate MAC format
+                        if re.match(r'^([0-9A-F]{2}:){5}[0-9A-F]{2}$', mac):
+                            return mac
+        except Exception:
+            pass
+        
+        # Method 2: Try 'arp' command (fallback for older systems)
+        try:
+            result = subprocess.run(
+                ['arp', '-n', ip],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0:
+                # Output format varies, but MAC is usually in format XX:XX:XX:XX:XX:XX
+                for line in result.stdout.splitlines():
+                    # Skip header line
+                    if 'HWaddress' in line or 'Address' in line:
+                        continue
+                    # Look for MAC address pattern
+                    mac_match = re.search(r'([0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}', line)
+                    if mac_match:
+                        mac = mac_match.group().upper().replace('-', ':')
+                        return mac
+        except Exception:
+            pass
+        
+        # Method 3: Read /proc/net/arp directly
+        try:
+            with open('/proc/net/arp', 'r') as f:
+                for line in f:
+                    if line.startswith(ip + ' ') or f' {ip} ' in line:
+                        parts = line.split()
+                        if len(parts) >= 4:
+                            mac = parts[3].upper()
+                            if re.match(r'^([0-9A-F]{2}:){5}[0-9A-F]{2}$', mac):
+                                return mac
+        except Exception:
+            pass
+            
+    except Exception as e:
+        print(f"    Warning: Could not get MAC for {ip}: {e}")
+    
+    return None
+
+
+def extract_ip_from_uri(uri):
+    """Extract IP address from a printer URI like socket://192.168.1.100:9100"""
+    if not uri:
+        return None
+    try:
+        if '://' in uri:
+            addr_part = uri.split('://')[1]
+            # Remove port if present
+            if ':' in addr_part:
+                return addr_part.split(':')[0]
+            return addr_part
+    except Exception:
+        pass
+    return None
+
+
+def get_printer_name_by_mac(mac, registry):
+    """Look up printer name by MAC address in the registry."""
+    if not mac:
+        return None
+    mac_upper = mac.upper()
+    return registry.get(mac_upper, {}).get('name')
+
+
+def get_printer_by_uri(uri, existing_printers):
+    """Find existing printer name by URI."""
+    for name, info in existing_printers.items():
+        if info.get('uri') == uri:
+            return name
+    return None
+
+
+def update_printer_uri(printer_name, new_uri):
+    """Update an existing printer's URI (when IP changes but MAC is same)."""
+    try:
+        print(f"    Updating {printer_name} URI to {new_uri}")
+        result = subprocess.run(
+            ['lpadmin', '-p', printer_name, '-v', new_uri],
+            capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            print(f"    ✓ Updated {printer_name} URI successfully")
+            return True
+        else:
+            print(f"    ✗ Failed to update {printer_name}: {result.stderr.strip()}")
+            return False
+    except Exception as e:
+        print(f"    ✗ Error updating {printer_name}: {e}")
+        return False
+
+
+def get_existing_printers_with_uris():
+    """Get a dict of existing printer names with their URIs."""
+    printers = {}
+    try:
+        # Get printer names
+        result = subprocess.run(['lpstat', '-p'], capture_output=True, text=True)
+        if result.returncode != 0:
+            return printers
+        
+        for line in result.stdout.splitlines():
+            if line.startswith('printer '):
+                parts = line.split()
+                if len(parts) >= 2:
+                    name = parts[1]
+                    printers[name] = {'uri': None}
+        
+        # Get URIs for each printer
+        result = subprocess.run(['lpstat', '-v'], capture_output=True, text=True)
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                # Format: "device for printer_1: socket://192.168.1.100:9100"
+                if ': ' in line and 'device for ' in line:
+                    parts = line.split(': ', 1)
+                    if len(parts) == 2:
+                        name_part = parts[0].replace('device for ', '').strip()
+                        uri = parts[1].strip()
+                        if name_part in printers:
+                            printers[name_part]['uri'] = uri
+        
+        return printers
+    except Exception as e:
+        print(f"  Error getting existing printers: {e}")
+        return printers
 
 
 def get_hostname():
@@ -154,29 +384,26 @@ def scan_network_for_printers():
 
 def discover_and_add_printers():
     """
-    Discover network printers and add any new ones to CUPS.
+    Discover network printers and add/update them in CUPS.
+    Uses MAC addresses to identify physical printers and prevent duplicates.
+    
+    When a printer's IP changes (DHCP), this function will:
+    - Recognize the printer by its MAC address
+    - Update the existing printer's URI instead of creating a duplicate
+    
     Uses both passive (lpinfo) and active (nmap) discovery.
-    Idempotent: skips URIs that are already configured.
     """
     try:
-        # Existing printers and URIs
-        existing_printers = subprocess.run(
-            ['lpstat', '-p'], capture_output=True, text=True
-        ).stdout
-        existing_names = [
-            line.split()[1] for line in existing_printers.splitlines()
-            if line.startswith('printer ')
-        ]
-
-        existing_uri_output = subprocess.run(
-            ['lpstat', '-v'], capture_output=True, text=True
-        ).stdout
-        existing_uris = set()
-        for line in existing_uri_output.splitlines():
-            if ': ' in line:
-                existing_uris.add(line.split(': ', 1)[1].strip())
+        # Load MAC registry
+        mac_registry = load_mac_registry()
+        
+        # Get existing printers with their URIs
+        existing_printers = get_existing_printers_with_uris()
+        existing_names = list(existing_printers.keys())
+        existing_uris = set(p['uri'] for p in existing_printers.values() if p.get('uri'))
         
         print(f"  Currently {len(existing_names)} printer(s) configured")
+        print(f"  MAC registry has {len(mac_registry)} known printer(s)")
         
         discovered_uris = set()
         
@@ -208,28 +435,143 @@ def discover_and_add_printers():
                 pass
 
         new_printers = []
+        updated_printers = []
+        skipped_printers = []
+        registry_changed = False
+        
         for uri in discovered_uris:
-            if uri in existing_uris:
-                print(f"    Skipping {uri} (already configured)")
+            ip = extract_ip_from_uri(uri)
+            if not ip:
+                print(f"    Skipping {uri} (could not extract IP)")
                 continue
-            name = f"printer_{next_idx}"
-            next_idx += 1
-            print(f"  Adding new printer {name} -> {uri}")
-            add_cmd = ['lpadmin', '-p', name, '-v', uri, '-E']
-            result = subprocess.run(add_cmd, capture_output=True, text=True)
-            if result.returncode == 0:
-                new_printers.append((name, uri))
-                print(f"    ✓ Added {name}")
+            
+            # Get MAC address for this printer
+            print(f"  Checking printer at {ip}...")
+            mac = get_mac_address(ip)
+            
+            if mac:
+                print(f"    MAC address: {mac}")
+                
+                # Check if this MAC is already known
+                existing_name = get_printer_name_by_mac(mac, mac_registry)
+                
+                if existing_name:
+                    # MAC is known - this is an existing printer
+                    old_uri = existing_printers.get(existing_name, {}).get('uri')
+                    
+                    if old_uri == uri:
+                        # Same IP, nothing to do
+                        print(f"    ✓ {existing_name} unchanged (MAC: {mac})")
+                        skipped_printers.append((existing_name, uri))
+                    elif existing_name in existing_printers:
+                        # IP changed - update the existing printer's URI
+                        print(f"    ⚠ {existing_name} IP changed! Old: {old_uri} -> New: {uri}")
+                        if update_printer_uri(existing_name, uri):
+                            # Update registry with new IP info
+                            mac_registry[mac]['last_ip'] = ip
+                            mac_registry[mac]['last_uri'] = uri
+                            mac_registry[mac]['last_seen'] = datetime.now().isoformat()
+                            registry_changed = True
+                            updated_printers.append((existing_name, uri, old_uri))
+                        else:
+                            print(f"    ✗ Failed to update {existing_name}")
+                    else:
+                        # Printer was in registry but not in CUPS (maybe manually deleted)
+                        # Re-add it with the same name
+                        print(f"    Re-adding {existing_name} (was in registry but not in CUPS)")
+                        add_cmd = ['lpadmin', '-p', existing_name, '-v', uri, '-E']
+                        result = subprocess.run(add_cmd, capture_output=True, text=True)
+                        if result.returncode == 0:
+                            mac_registry[mac]['last_ip'] = ip
+                            mac_registry[mac]['last_uri'] = uri
+                            mac_registry[mac]['last_seen'] = datetime.now().isoformat()
+                            registry_changed = True
+                            new_printers.append((existing_name, uri))
+                            print(f"    ✓ Re-added {existing_name}")
+                        else:
+                            print(f"    ✗ Failed to re-add {existing_name}: {result.stderr.strip()}")
+                else:
+                    # New MAC - this is a new printer
+                    if uri in existing_uris:
+                        # URI already configured but MAC not in registry
+                        # Find the printer name and add MAC to registry
+                        for name, info in existing_printers.items():
+                            if info.get('uri') == uri:
+                                print(f"    Adding MAC to registry for existing {name}")
+                                mac_registry[mac] = {
+                                    'name': name,
+                                    'last_ip': ip,
+                                    'last_uri': uri,
+                                    'first_seen': datetime.now().isoformat(),
+                                    'last_seen': datetime.now().isoformat()
+                                }
+                                registry_changed = True
+                                skipped_printers.append((name, uri))
+                                break
+                    else:
+                        # Truly new printer
+                        name = f"printer_{next_idx}"
+                        next_idx += 1
+                        print(f"  Adding NEW printer {name} -> {uri} (MAC: {mac})")
+                        add_cmd = ['lpadmin', '-p', name, '-v', uri, '-E']
+                        result = subprocess.run(add_cmd, capture_output=True, text=True)
+                        if result.returncode == 0:
+                            # Add to MAC registry
+                            mac_registry[mac] = {
+                                'name': name,
+                                'last_ip': ip,
+                                'last_uri': uri,
+                                'first_seen': datetime.now().isoformat(),
+                                'last_seen': datetime.now().isoformat()
+                            }
+                            registry_changed = True
+                            new_printers.append((name, uri))
+                            print(f"    ✓ Added {name} and registered MAC")
+                        else:
+                            print(f"    ✗ Failed to add {name}: {result.stderr.strip()}")
             else:
-                print(f"    ✗ Failed to add {name}: {result.stderr.strip()}")
+                # Could not get MAC address - fall back to URI-based check
+                print(f"    ⚠ Could not get MAC address for {ip}")
+                
+                if uri in existing_uris:
+                    print(f"    Skipping {uri} (already configured, no MAC)")
+                    continue
+                
+                # Add as new printer without MAC registration
+                name = f"printer_{next_idx}"
+                next_idx += 1
+                print(f"  Adding new printer {name} -> {uri} (no MAC available)")
+                add_cmd = ['lpadmin', '-p', name, '-v', uri, '-E']
+                result = subprocess.run(add_cmd, capture_output=True, text=True)
+                if result.returncode == 0:
+                    new_printers.append((name, uri))
+                    print(f"    ✓ Added {name} (WARNING: no MAC, may create duplicates if IP changes)")
+                else:
+                    print(f"    ✗ Failed to add {name}: {result.stderr.strip()}")
 
+        # Save MAC registry if changed
+        if registry_changed:
+            save_mac_registry(mac_registry)
+
+        # Summary
+        print("\n  Discovery Summary:")
         if new_printers:
-            print(f"Discovered and added {len(new_printers)} new printer(s).")
-        else:
-            print("No new printers discovered.")
+            print(f"    ✓ Added {len(new_printers)} new printer(s)")
+            for name, uri in new_printers:
+                print(f"      - {name}: {uri}")
+        if updated_printers:
+            print(f"    ↻ Updated {len(updated_printers)} printer(s) with new IPs")
+            for name, new_uri, old_uri in updated_printers:
+                print(f"      - {name}: {old_uri} -> {new_uri}")
+        if skipped_printers:
+            print(f"    = {len(skipped_printers)} printer(s) unchanged")
+        if not new_printers and not updated_printers:
+            print("    No changes needed.")
 
     except Exception as e:
+        import traceback
         print(f"Printer discovery error: {e}")
+        traceback.print_exc()
 
 
 def get_system_uptime():

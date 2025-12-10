@@ -571,12 +571,73 @@ set -e
 echo ""
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# NETWORK PRINTER DISCOVERY
+# NETWORK PRINTER DISCOVERY (with MAC-based identification)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 
+# This section uses MAC addresses to identify physical printers.
+# This prevents duplicate printer entries when IPs change (DHCP).
+#
+# Registry file: /etc/cups/printer_mac_registry.json
+# Fallback: $INSTALL_DIR/printer_mac_registry.json
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 echo ""
-echo -e "${YELLOW}▸ Scanning for network printers...${NC}"
+echo -e "${YELLOW}▸ Scanning for network printers (MAC-based identification)...${NC}"
 echo -e "${CYAN}  This may take up to 30 seconds...${NC}"
+
+# MAC Registry file locations
+MAC_REGISTRY_PATH="/etc/cups/printer_mac_registry.json"
+MAC_REGISTRY_FALLBACK="$INSTALL_DIR/printer_mac_registry.json"
+
+# Function to get MAC address for an IP
+get_mac_address() {
+    local ip="$1"
+    local mac=""
+    
+    # Ping first to ensure IP is in ARP cache
+    ping -c 1 -W 2 "$ip" >/dev/null 2>&1
+    sleep 0.5
+    
+    # Method 1: ip neighbor (newer systems)
+    mac=$(ip neighbor show "$ip" 2>/dev/null | awk '/lladdr/ {print toupper($5)}')
+    
+    # Method 2: arp command (fallback)
+    if [ -z "$mac" ]; then
+        mac=$(arp -n "$ip" 2>/dev/null | awk 'NR>1 {print toupper($3)}' | grep -E '^([0-9A-F]{2}:){5}[0-9A-F]{2}$')
+    fi
+    
+    # Method 3: /proc/net/arp (last resort)
+    if [ -z "$mac" ]; then
+        mac=$(grep "^$ip " /proc/net/arp 2>/dev/null | awk '{print toupper($4)}' | grep -E '^([0-9A-F]{2}:){5}[0-9A-F]{2}$')
+    fi
+    
+    echo "$mac"
+}
+
+# Function to load MAC registry
+load_mac_registry() {
+    if [ -f "$MAC_REGISTRY_PATH" ]; then
+        cat "$MAC_REGISTRY_PATH"
+    elif [ -f "$MAC_REGISTRY_FALLBACK" ]; then
+        cat "$MAC_REGISTRY_FALLBACK"
+    else
+        echo "{}"
+    fi
+}
+
+# Function to save MAC registry
+save_mac_registry() {
+    local data="$1"
+    
+    # Try primary path first
+    if [ -d "$(dirname "$MAC_REGISTRY_PATH")" ]; then
+        echo "$data" | sudo tee "$MAC_REGISTRY_PATH" >/dev/null 2>&1 && return 0
+    fi
+    
+    # Fallback to install directory
+    mkdir -p "$(dirname "$MAC_REGISTRY_FALLBACK")"
+    echo "$data" > "$MAC_REGISTRY_FALLBACK"
+}
 
 # Get local network subnet
 LOCAL_IP=$(hostname -I | awk '{print $1}')
@@ -586,6 +647,12 @@ SUBNET=$(echo "$LOCAL_IP" | cut -d'.' -f1-3)
 echo -e "${CYAN}  Scanning subnet: ${SUBNET}.0/24${NC}"
 
 DISCOVERED_PRINTERS=()
+
+# Load existing MAC registry
+echo -e "${CYAN}  Loading MAC registry...${NC}"
+MAC_REGISTRY=$(load_mac_registry)
+MAC_REGISTRY_COUNT=$(echo "$MAC_REGISTRY" | grep -c '"name"' || echo "0")
+echo -e "${CYAN}  MAC registry has $MAC_REGISTRY_COUNT known printer(s)${NC}"
 
 # Find the highest existing printer_N number to avoid naming conflicts
 EXISTING_PRINTER_NUMS=$(lpstat -p 2>/dev/null | awk '{print $2}' | grep -oP '^printer_\K[0-9]+' | sort -n | tail -1)
@@ -616,49 +683,201 @@ else
     done
 fi
 
-# Get already configured printer URIs
+# Get already configured printer URIs and names
 EXISTING_URIS=$(lpstat -v 2>/dev/null | grep -oP 'device for \S+: \K.*' | sort -u)
+
+# Counters for summary
+NEW_PRINTERS_COUNT=0
+UPDATED_PRINTERS_COUNT=0
+SKIPPED_PRINTERS_COUNT=0
 
 # Process discovered printers
 if [ ! -z "$SCAN_RESULTS" ]; then
     echo -e "${GREEN}✓ Found network printer(s)!${NC}"
     
+    # We'll build an updated registry
+    UPDATED_REGISTRY="$MAC_REGISTRY"
+    
     while IFS= read -r IP; do
         [ -z "$IP" ] && continue
         
-        # Check if this IP is already configured
-        IS_CONFIGURED=false
-        while IFS= read -r uri; do
-            if [[ "$uri" == *"$IP"* ]]; then
-                IS_CONFIGURED=true
-                break
-            fi
-        done <<< "$EXISTING_URIS"
+        echo -e "${YELLOW}  ▸ Checking printer at $IP...${NC}"
         
-        if [ "$IS_CONFIGURED" = false ]; then
-            echo -e "${YELLOW}  ▸ New printer found at $IP${NC}"
+        # Get MAC address for this printer
+        MAC=$(get_mac_address "$IP")
+        PRINTER_URI="socket://$IP:9100"
+        
+        if [ ! -z "$MAC" ]; then
+            echo -e "${CYAN}    MAC address: $MAC${NC}"
             
-            # Auto-configure with test name
-            PRINTER_NAME="printer_$NEXT_PRINTER_NUM"
-            PRINTER_URI="socket://$IP:9100"
+            # Check if this MAC is in the registry
+            EXISTING_NAME=$(echo "$MAC_REGISTRY" | $PYTHON_CMD -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    mac = '$MAC'.upper()
+    if mac in data:
+        print(data[mac].get('name', ''))
+except:
+    pass
+" 2>/dev/null)
             
-            echo -e "${CYAN}    Adding as: $PRINTER_NAME${NC}"
-            
-            # Add printer to CUPS (raw mode)
-            if sudo lpadmin -p "$PRINTER_NAME" -v "$PRINTER_URI" -E 2>/dev/null; then
-                echo -e "${GREEN}    ✓ Printer configured (raw mode)${NC}"
-                DISCOVERED_PRINTERS+=("$PRINTER_NAME:$IP")
-                NEXT_PRINTER_NUM=$((NEXT_PRINTER_NUM + 1))
+            if [ ! -z "$EXISTING_NAME" ]; then
+                # MAC is known - check if we need to update the URI
+                OLD_URI=$(lpstat -v "$EXISTING_NAME" 2>/dev/null | grep -oP 'device for \S+: \K.*' || echo "")
+                
+                if [ "$OLD_URI" == "$PRINTER_URI" ]; then
+                    echo -e "${GREEN}    ✓ $EXISTING_NAME unchanged (MAC: $MAC)${NC}"
+                    SKIPPED_PRINTERS_COUNT=$((SKIPPED_PRINTERS_COUNT + 1))
+                elif lpstat -p "$EXISTING_NAME" >/dev/null 2>&1; then
+                    # Printer exists but IP changed - update it
+                    echo -e "${YELLOW}    ⚠ $EXISTING_NAME IP changed! Updating...${NC}"
+                    echo -e "${CYAN}      Old: $OLD_URI${NC}"
+                    echo -e "${CYAN}      New: $PRINTER_URI${NC}"
+                    
+                    if sudo lpadmin -p "$EXISTING_NAME" -v "$PRINTER_URI" 2>/dev/null; then
+                        echo -e "${GREEN}    ✓ Updated $EXISTING_NAME URI${NC}"
+                        UPDATED_PRINTERS_COUNT=$((UPDATED_PRINTERS_COUNT + 1))
+                        
+                        # Update registry
+                        UPDATED_REGISTRY=$(echo "$UPDATED_REGISTRY" | $PYTHON_CMD -c "
+import sys, json
+from datetime import datetime
+data = json.load(sys.stdin)
+mac = '$MAC'.upper()
+if mac in data:
+    data[mac]['last_ip'] = '$IP'
+    data[mac]['last_uri'] = '$PRINTER_URI'
+    data[mac]['last_seen'] = datetime.now().isoformat()
+print(json.dumps(data, indent=2))
+" 2>/dev/null)
+                    else
+                        echo -e "${RED}    ✗ Failed to update $EXISTING_NAME${NC}"
+                    fi
+                else
+                    # Printer was in registry but not in CUPS - re-add it
+                    echo -e "${YELLOW}    Re-adding $EXISTING_NAME (was removed from CUPS)${NC}"
+                    if sudo lpadmin -p "$EXISTING_NAME" -v "$PRINTER_URI" -E 2>/dev/null; then
+                        echo -e "${GREEN}    ✓ Re-added $EXISTING_NAME${NC}"
+                        NEW_PRINTERS_COUNT=$((NEW_PRINTERS_COUNT + 1))
+                        DISCOVERED_PRINTERS+=("$EXISTING_NAME:$IP:$MAC")
+                    else
+                        echo -e "${RED}    ✗ Failed to re-add $EXISTING_NAME${NC}"
+                    fi
+                fi
             else
-                echo -e "${RED}    ✗ Failed to configure printer${NC}"
+                # New MAC - check if URI is already configured
+                IS_CONFIGURED=false
+                CONFIGURED_NAME=""
+                while IFS= read -r uri; do
+                    if [[ "$uri" == *"$IP"* ]]; then
+                        IS_CONFIGURED=true
+                        # Find the printer name for this URI
+                        CONFIGURED_NAME=$(lpstat -v 2>/dev/null | grep "$uri" | awk '{print $3}' | tr -d ':')
+                        break
+                    fi
+                done <<< "$EXISTING_URIS"
+                
+                if [ "$IS_CONFIGURED" = true ] && [ ! -z "$CONFIGURED_NAME" ]; then
+                    # URI exists but MAC not in registry - add MAC to registry
+                    echo -e "${CYAN}    Adding MAC to registry for existing $CONFIGURED_NAME${NC}"
+                    UPDATED_REGISTRY=$(echo "$UPDATED_REGISTRY" | $PYTHON_CMD -c "
+import sys, json
+from datetime import datetime
+data = json.load(sys.stdin)
+mac = '$MAC'.upper()
+data[mac] = {
+    'name': '$CONFIGURED_NAME',
+    'last_ip': '$IP',
+    'last_uri': '$PRINTER_URI',
+    'first_seen': datetime.now().isoformat(),
+    'last_seen': datetime.now().isoformat()
+}
+print(json.dumps(data, indent=2))
+" 2>/dev/null)
+                    SKIPPED_PRINTERS_COUNT=$((SKIPPED_PRINTERS_COUNT + 1))
+                else
+                    # Truly new printer
+                    PRINTER_NAME="printer_$NEXT_PRINTER_NUM"
+                    echo -e "${YELLOW}    NEW printer! Adding as: $PRINTER_NAME${NC}"
+                    
+                    if sudo lpadmin -p "$PRINTER_NAME" -v "$PRINTER_URI" -E 2>/dev/null; then
+                        echo -e "${GREEN}    ✓ Printer configured (raw mode)${NC}"
+                        echo -e "${GREEN}    ✓ MAC registered: $MAC${NC}"
+                        DISCOVERED_PRINTERS+=("$PRINTER_NAME:$IP:$MAC")
+                        NEW_PRINTERS_COUNT=$((NEW_PRINTERS_COUNT + 1))
+                        NEXT_PRINTER_NUM=$((NEXT_PRINTER_NUM + 1))
+                        
+                        # Add to registry
+                        UPDATED_REGISTRY=$(echo "$UPDATED_REGISTRY" | $PYTHON_CMD -c "
+import sys, json
+from datetime import datetime
+data = json.load(sys.stdin)
+mac = '$MAC'.upper()
+data[mac] = {
+    'name': '$PRINTER_NAME',
+    'last_ip': '$IP',
+    'last_uri': '$PRINTER_URI',
+    'first_seen': datetime.now().isoformat(),
+    'last_seen': datetime.now().isoformat()
+}
+print(json.dumps(data, indent=2))
+" 2>/dev/null)
+                    else
+                        echo -e "${RED}    ✗ Failed to configure printer${NC}"
+                    fi
+                fi
             fi
         else
-            echo -e "${CYAN}  ▸ Printer at $IP already configured${NC}"
+            # Could not get MAC - fall back to URI-based check
+            echo -e "${YELLOW}    ⚠ Could not get MAC address${NC}"
+            
+            IS_CONFIGURED=false
+            while IFS= read -r uri; do
+                if [[ "$uri" == *"$IP"* ]]; then
+                    IS_CONFIGURED=true
+                    break
+                fi
+            done <<< "$EXISTING_URIS"
+            
+            if [ "$IS_CONFIGURED" = false ]; then
+                PRINTER_NAME="printer_$NEXT_PRINTER_NUM"
+                echo -e "${YELLOW}    Adding as: $PRINTER_NAME (no MAC - may create duplicates if IP changes)${NC}"
+                
+                if sudo lpadmin -p "$PRINTER_NAME" -v "$PRINTER_URI" -E 2>/dev/null; then
+                    echo -e "${GREEN}    ✓ Printer configured (raw mode)${NC}"
+                    DISCOVERED_PRINTERS+=("$PRINTER_NAME:$IP:NO_MAC")
+                    NEW_PRINTERS_COUNT=$((NEW_PRINTERS_COUNT + 1))
+                    NEXT_PRINTER_NUM=$((NEXT_PRINTER_NUM + 1))
+                else
+                    echo -e "${RED}    ✗ Failed to configure printer${NC}"
+                fi
+            else
+                echo -e "${CYAN}    Printer at $IP already configured (no MAC to register)${NC}"
+                SKIPPED_PRINTERS_COUNT=$((SKIPPED_PRINTERS_COUNT + 1))
+            fi
         fi
     done <<< "$(echo -e "$SCAN_RESULTS")"
+    
+    # Save updated registry
+    if [ "$UPDATED_REGISTRY" != "$MAC_REGISTRY" ]; then
+        echo ""
+        echo -e "${CYAN}  Saving updated MAC registry...${NC}"
+        save_mac_registry "$UPDATED_REGISTRY"
+        echo -e "${GREEN}  ✓ MAC registry saved${NC}"
+    fi
 else
-    echo -e "${YELLOW}⚠ No new network printers discovered${NC}"
+    echo -e "${YELLOW}⚠ No network printers discovered${NC}"
 fi
+
+# Summary
+echo ""
+echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${BOLD}Printer Discovery Summary:${NC}"
+echo -e "${GREEN}  ✓ New printers added: $NEW_PRINTERS_COUNT${NC}"
+echo -e "${YELLOW}  ↻ Printers updated (IP changed): $UPDATED_PRINTERS_COUNT${NC}"
+echo -e "${CYAN}  = Printers unchanged: $SKIPPED_PRINTERS_COUNT${NC}"
+echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 
 echo ""
 
