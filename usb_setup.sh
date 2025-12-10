@@ -639,9 +639,26 @@ save_mac_registry() {
     echo "$data" > "$MAC_REGISTRY_FALLBACK"
 }
 
-# Get local network subnet
+# Get local network subnet dynamically from the default gateway
+# This ensures we scan the correct network even with multiple interfaces
+echo -e "${CYAN}  Detecting network configuration...${NC}"
+
+# Method 1: Get gateway from default route (most reliable)
+GATEWAY=$(ip route | grep default | awk '{print $3}' | head -n1)
+
+if [ ! -z "$GATEWAY" ]; then
+    SUBNET=$(echo "$GATEWAY" | cut -d'.' -f1-3)
+    echo -e "${CYAN}  Default gateway: $GATEWAY${NC}"
+else
+    # Fallback: Use local IP's subnet
+    LOCAL_IP=$(hostname -I | awk '{print $1}')
+    SUBNET=$(echo "$LOCAL_IP" | cut -d'.' -f1-3)
+    echo -e "${YELLOW}  Could not detect gateway, using local IP subnet${NC}"
+fi
+
+# Also get the local IP for display
 LOCAL_IP=$(hostname -I | awk '{print $1}')
-SUBNET=$(echo "$LOCAL_IP" | cut -d'.' -f1-3)
+echo -e "${CYAN}  Local IP: $LOCAL_IP${NC}"
 
 # Scan common printer ports (9100, 515, 631) on local network
 echo -e "${CYAN}  Scanning subnet: ${SUBNET}.0/24${NC}"

@@ -322,6 +322,64 @@ def get_configured_printers():
         return []
 
 
+def get_network_gateway():
+    """Get the default gateway IP address."""
+    try:
+        # Method 1: Parse 'ip route' output (most reliable on Linux)
+        result = subprocess.run(['ip', 'route'], capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                if line.startswith('default'):
+                    parts = line.split()
+                    for i, part in enumerate(parts):
+                        if part == 'via' and i + 1 < len(parts):
+                            gateway = parts[i + 1]
+                            # Validate it looks like an IP
+                            if re.match(r'^\d+\.\d+\.\d+\.\d+$', gateway):
+                                return gateway
+    except Exception:
+        pass
+    
+    try:
+        # Method 2: Parse 'route -n' output (fallback)
+        result = subprocess.run(['route', '-n'], capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                parts = line.split()
+                if len(parts) >= 2 and parts[0] == '0.0.0.0':
+                    gateway = parts[1]
+                    if re.match(r'^\d+\.\d+\.\d+\.\d+$', gateway):
+                        return gateway
+    except Exception:
+        pass
+    
+    return None
+
+
+def get_network_subnet():
+    """
+    Get the network subnet to scan, dynamically from the default gateway.
+    This ensures we scan the correct network even with multiple interfaces.
+    Returns subnet like '192.168.1' (first 3 octets).
+    """
+    # Try to get subnet from gateway first (most reliable)
+    gateway = get_network_gateway()
+    if gateway:
+        subnet = '.'.join(gateway.split('.')[:3])
+        print(f"  Detected gateway: {gateway}")
+        print(f"  Using subnet: {subnet}.0/24")
+        return subnet
+    
+    # Fallback: use local IP's subnet
+    local_ip = get_local_ip()
+    if local_ip and local_ip != "Unknown":
+        subnet = '.'.join(local_ip.split('.')[:3])
+        print(f"  Could not detect gateway, using local IP subnet: {subnet}.0/24")
+        return subnet
+    
+    return None
+
+
 def scan_network_for_printers():
     """
     Actively scan the network for printers on port 9100.
@@ -330,13 +388,12 @@ def scan_network_for_printers():
     """
     discovered = []
     try:
-        # Get local IP and subnet
-        local_ip = get_local_ip()
-        if not local_ip or local_ip == "Unknown":
-            print("  Cannot determine local IP for network scan")
+        # Get subnet dynamically from gateway
+        subnet = get_network_subnet()
+        if not subnet:
+            print("  Cannot determine network subnet for scanning")
             return discovered
         
-        subnet = '.'.join(local_ip.split('.')[:3])
         print(f"  Scanning subnet {subnet}.0/24 for printers on port 9100...")
         
         # Try nmap first (faster and more reliable)
