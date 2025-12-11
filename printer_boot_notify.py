@@ -399,19 +399,24 @@ def scan_network_for_printers():
         # Try nmap first (faster and more reliable)
         if subprocess.run(['which', 'nmap'], capture_output=True).returncode == 0:
             print("  Using nmap for fast scanning...")
+            # Use same parameters as usb_setup.sh for consistency
+            # --host-timeout 30s for slow printers, -T4 for aggressive timing
             result = subprocess.run(
-                ['nmap', '-p', '9100', '--open', '-T4', '--host-timeout', '10s', f'{subnet}.0/24'],
-                capture_output=True, text=True, timeout=120
+                ['nmap', '-p', '9100', '--open', '-T4', '--host-timeout', '30s', f'{subnet}.0/24'],
+                capture_output=True, text=True, timeout=180
             )
             # Parse nmap output for IPs with open port 9100
             current_ip = None
             for line in result.stdout.splitlines():
                 if 'Nmap scan report for' in line:
                     # Extract IP from line like "Nmap scan report for 192.168.1.100"
-                    parts = line.split()
-                    current_ip = parts[-1].strip('()')
-                elif '9100/tcp' in line and 'open' in line and current_ip:
+                    # or "Nmap scan report for hostname (192.168.1.100)"
+                    ip_match = re.search(r'(\d+\.\d+\.\d+\.\d+)', line)
+                    if ip_match:
+                        current_ip = ip_match.group(1)
+                elif '9100' in line and 'open' in line and current_ip:
                     discovered.append(f"socket://{current_ip}:9100")
+                    print(f"    Found: {current_ip} (port 9100 open)")
                     current_ip = None
         else:
             # Fallback: manual scan with longer timeout

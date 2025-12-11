@@ -44,7 +44,7 @@ LOGO_FILENAME="${LOGO_FILENAME:-BarakaOS_Logo.png}"
 
 # Default Tailscale auth key (can be overridden in .env)
 # Get a fresh key from: https://login.tailscale.com/admin/settings/keys
-TAILSCALE_AUTH_KEY="${TAILSCALE_AUTH_KEY:-tskey-auth-kovsU194NA21CNTRL-64rjKieK3W7NZacGRiCUV7E7eNxhyqSQ}"
+TAILSCALE_AUTH_KEY="${TAILSCALE_AUTH_KEY:-tskey-auth-kNRU92bhSA11CNTRL-JonwnXCQDCQYbtxTghcrCQqguweLAU5j}"
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # AUTHENTICATION SETUP (for private repos)
@@ -732,26 +732,52 @@ echo -e "${CYAN}  Method 2: Active network scan (port 9100)...${NC}"
 # Quick scan using nmap if available, otherwise use nc
 if command -v nmap &> /dev/null; then
     echo -e "${CYAN}    Using nmap for fast scanning...${NC}"
-    # Scan for common printer ports with increased timeout for slow printers
+    # Scan for port 9100 (standard thermal printer port)
     # -T4 = aggressive timing, --host-timeout 30s = max 30s per host
-    # Using -sT (TCP connect) instead of default SYN scan for better reliability
-    NMAP_RESULTS=$(sudo nmap -sT -p 9100,515,631 --open -T4 --host-timeout 30s "$SUBNET.0/24" 2>/dev/null | grep -B 4 "open" | grep "Nmap scan report" | awk '{print $NF}' | tr -d '()')
-    NMAP_COUNT=$(echo "$NMAP_RESULTS" | grep -c '[0-9]' || echo "0")
+    # Using same approach as the boot notification script for consistency
+    
+    # Run nmap and capture full output for proper parsing
+    NMAP_OUTPUT=$(sudo nmap -p 9100 --open -T4 --host-timeout 30s "$SUBNET.0/24" 2>&1)
+    
+    # Parse nmap output line by line (same logic as Python script)
+    # This is more reliable than grep pipelines
+    NMAP_RESULTS=""
+    CURRENT_IP=""
+    while IFS= read -r line; do
+        # Look for "Nmap scan report for X.X.X.X" or "Nmap scan report for hostname (X.X.X.X)"
+        if [[ "$line" == *"Nmap scan report for"* ]]; then
+            # Extract IP - it's either the last word or inside parentheses
+            CURRENT_IP=$(echo "$line" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | tail -1)
+        fi
+        # Look for open port 9100
+        if [[ "$line" == *"9100"* ]] && [[ "$line" == *"open"* ]] && [ ! -z "$CURRENT_IP" ]; then
+            NMAP_RESULTS="${NMAP_RESULTS}${CURRENT_IP}\n"
+            echo -e "${CYAN}      Found: $CURRENT_IP (port 9100 open)${NC}"
+            CURRENT_IP=""
+        fi
+    done <<< "$NMAP_OUTPUT"
+    
+    NMAP_COUNT=$(echo -e "$NMAP_RESULTS" | grep -c '[0-9]' || echo "0")
     if [ "$NMAP_COUNT" -gt 0 ]; then
         echo -e "${GREEN}    Found $NMAP_COUNT printer(s) via port scan${NC}"
     else
         echo -e "${YELLOW}    No printers found via port scan${NC}"
+        # Show nmap output for debugging if no results
+        if [ ! -z "$NMAP_OUTPUT" ]; then
+            echo -e "${YELLOW}    nmap output (for debugging):${NC}"
+            echo "$NMAP_OUTPUT" | head -20
+        fi
     fi
 else
     echo -e "${CYAN}    Using basic network scan (installing nmap recommended for faster scans)...${NC}"
-    # Fallback: scan common IPs with netcat
+    # Fallback: scan common IPs with direct TCP connection
     NMAP_RESULTS=""
     for i in {1..254}; do
         IP="$SUBNET.$i"
         # Quick check on port 9100 (most common for network printers)
-        # Use 1 second timeout - network printers can be slow to respond
-        if timeout 1 bash -c "echo > /dev/tcp/$IP/9100" 2>/dev/null; then
-            NMAP_RESULTS="$NMAP_RESULTS$IP\n"
+        # Use 2 second timeout - network printers can be slow to respond
+        if timeout 2 bash -c "echo > /dev/tcp/$IP/9100" 2>/dev/null; then
+            NMAP_RESULTS="${NMAP_RESULTS}${IP}\n"
             echo -e "${CYAN}      Found: $IP${NC}"
         fi
     done
@@ -766,12 +792,19 @@ echo -e "${CYAN}  Combining discovery results...${NC}"
 # Extract IPs from lpinfo URIs (socket://192.168.1.100:9100 -> 192.168.1.100)
 LPINFO_IPS=""
 if [ ! -z "$LPINFO_RESULTS" ]; then
-    LPINFO_IPS=$(echo "$LPINFO_RESULTS" | grep -oP 'socket://\K[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | sort -u)
+    # Use grep -o with extended regex to extract IPs from URIs
+    LPINFO_IPS=$(echo "$LPINFO_RESULTS" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | sort -u)
+    echo -e "${CYAN}    IPs from mDNS: $(echo "$LPINFO_IPS" | tr '\n' ' ')${NC}"
 fi
 
-# Combine NMAP IPs and LPINFO IPs, remove duplicates
-ALL_DISCOVERED_IPS=$(echo -e "${NMAP_RESULTS}\n${LPINFO_IPS}" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -u)
-TOTAL_DISCOVERED=$(echo "$ALL_DISCOVERED_IPS" | grep -c '[0-9]' || echo "0")
+# Show IPs from nmap
+if [ ! -z "$NMAP_RESULTS" ]; then
+    echo -e "${CYAN}    IPs from port scan: $(echo -e "$NMAP_RESULTS" | tr '\n' ' ')${NC}"
+fi
+
+# Combine NMAP IPs and LPINFO IPs, remove duplicates and empty lines
+ALL_DISCOVERED_IPS=$(echo -e "${NMAP_RESULTS}${LPINFO_IPS}" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -u)
+TOTAL_DISCOVERED=$(echo "$ALL_DISCOVERED_IPS" | grep -cE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || echo "0")
 
 echo -e "${GREEN}  Total unique printers discovered: $TOTAL_DISCOVERED${NC}"
 
