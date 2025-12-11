@@ -681,22 +681,55 @@ fi
 echo -e "${CYAN}  Next printer number will be: printer_$NEXT_PRINTER_NUM${NC}"
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# WAIT FOR NETWORK TO STABILIZE
-# This improves discovery reliability, especially after network changes
+# WAIT FOR CUPS AND NETWORK TO BE READY
+# This is crucial for first-run discovery to work properly
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 echo ""
-echo -e "${CYAN}  Waiting 5 seconds for network to stabilize...${NC}"
-sleep 5
+echo -e "${CYAN}  Waiting for CUPS to be fully ready...${NC}"
+
+# Wait for CUPS scheduler to be running (max 30 seconds)
+CUPS_WAIT=0
+while [ $CUPS_WAIT -lt 30 ]; do
+    if lpstat -r 2>/dev/null | grep -qi "scheduler is running"; then
+        echo -e "${GREEN}    ✓ CUPS scheduler is running${NC}"
+        break
+    fi
+    sleep 2
+    CUPS_WAIT=$((CUPS_WAIT + 2))
+    echo -e "${CYAN}    Waiting for CUPS... (${CUPS_WAIT}s)${NC}"
+done
+
+if [ $CUPS_WAIT -ge 30 ]; then
+    echo -e "${YELLOW}    ⚠ CUPS may not be fully ready, continuing anyway...${NC}"
+fi
+
+# Restart CUPS to ensure mDNS discovery is active (important for first run)
+echo -e "${CYAN}  Restarting CUPS to ensure mDNS discovery is active...${NC}"
+sudo systemctl restart cups
+sleep 3
+
+echo -e "${CYAN}  Waiting 10 seconds for network printers to respond...${NC}"
+sleep 10
 
 # Ping the gateway to populate ARP cache and ensure network connectivity
 if [ ! -z "$GATEWAY" ]; then
     echo -e "${CYAN}  Checking network connectivity (ping gateway)...${NC}"
-    if ping -c 2 -W 2 "$GATEWAY" >/dev/null 2>&1; then
+    if ping -c 3 -W 2 "$GATEWAY" >/dev/null 2>&1; then
         echo -e "${GREEN}    ✓ Gateway reachable${NC}"
     else
         echo -e "${YELLOW}    ⚠ Gateway not responding, continuing anyway...${NC}"
     fi
 fi
+
+# Pre-scan: Ping the entire subnet to populate ARP cache
+# This helps nmap and MAC address detection
+echo -e "${CYAN}  Populating ARP cache (pinging subnet)...${NC}"
+for i in {1..254}; do
+    ping -c 1 -W 1 "$SUBNET.$i" >/dev/null 2>&1 &
+done
+# Wait for pings to complete (with timeout)
+sleep 5
+echo -e "${GREEN}    ✓ ARP cache populated${NC}"
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # DISCOVERY METHOD 1: Passive discovery via CUPS/lpinfo (mDNS/Bonjour)
@@ -706,9 +739,17 @@ echo ""
 echo -e "${CYAN}  Method 1: Passive discovery (mDNS/Bonjour via lpinfo)...${NC}"
 LPINFO_RESULTS=""
 if command -v lpinfo &> /dev/null; then
-    # Get socket:// URIs from lpinfo
-    LPINFO_RESULTS=$(lpinfo -v 2>/dev/null | grep -i 'socket://' | awk '{print $2}' | sort -u)
-    LPINFO_COUNT=$(echo "$LPINFO_RESULTS" | grep -c 'socket://' || echo "0")
+    # Run lpinfo with timeout and retry
+    for attempt in 1 2 3; do
+        echo -e "${CYAN}    Attempt $attempt/3...${NC}"
+        LPINFO_RESULTS=$(timeout 30 lpinfo -v 2>/dev/null | grep -i 'socket://' | awk '{print $2}' | sort -u)
+        LPINFO_COUNT=$(echo "$LPINFO_RESULTS" | grep -c 'socket://' 2>/dev/null || echo "0")
+        if [ "$LPINFO_COUNT" -gt 0 ]; then
+            break
+        fi
+        sleep 3
+    done
+    
     if [ "$LPINFO_COUNT" -gt 0 ]; then
         echo -e "${GREEN}    Found $LPINFO_COUNT printer(s) via mDNS/Bonjour${NC}"
         while IFS= read -r uri; do
@@ -716,7 +757,7 @@ if command -v lpinfo &> /dev/null; then
             echo -e "${CYAN}      → $uri${NC}"
         done <<< "$LPINFO_RESULTS"
     else
-        echo -e "${YELLOW}    No printers found via mDNS (printers may not support it)${NC}"
+        echo -e "${YELLOW}    No printers found via mDNS (printers may not support it or need more time)${NC}"
     fi
 else
     echo -e "${YELLOW}    lpinfo not available${NC}"
@@ -729,56 +770,92 @@ fi
 echo ""
 echo -e "${CYAN}  Method 2: Active network scan (port 9100)...${NC}"
 
-# Quick scan using nmap if available, otherwise use nc
-if command -v nmap &> /dev/null; then
-    echo -e "${CYAN}    Using nmap for fast scanning...${NC}"
-    # Scan for port 9100 (standard thermal printer port)
-    # -T4 = aggressive timing, --host-timeout 30s = max 30s per host
-    # Using same approach as the boot notification script for consistency
+# Function to run nmap scan
+run_nmap_scan() {
+    local subnet="$1"
+    local results=""
+    local current_ip=""
     
-    # Run nmap and capture full output for proper parsing
-    NMAP_OUTPUT=$(sudo nmap -p 9100 --open -T4 --host-timeout 30s "$SUBNET.0/24" 2>&1)
+    # Run nmap with:
+    # -sT: TCP connect scan (more reliable, doesn't require raw sockets)
+    # -p 9100: Only scan printer port
+    # --open: Only show open ports
+    # -T3: Normal timing (more reliable than T4 for slow printers)
+    # --host-timeout 45s: Give printers more time to respond
+    # --max-retries 3: Retry failed probes
+    local output=$(sudo nmap -sT -p 9100 --open -T3 --host-timeout 45s --max-retries 3 "$subnet.0/24" 2>&1)
     
-    # Parse nmap output line by line (same logic as Python script)
-    # This is more reliable than grep pipelines
-    NMAP_RESULTS=""
-    CURRENT_IP=""
     while IFS= read -r line; do
-        # Look for "Nmap scan report for X.X.X.X" or "Nmap scan report for hostname (X.X.X.X)"
         if [[ "$line" == *"Nmap scan report for"* ]]; then
-            # Extract IP - it's either the last word or inside parentheses
-            CURRENT_IP=$(echo "$line" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | tail -1)
+            current_ip=$(echo "$line" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | tail -1)
         fi
-        # Look for open port 9100
-        if [[ "$line" == *"9100"* ]] && [[ "$line" == *"open"* ]] && [ ! -z "$CURRENT_IP" ]; then
-            NMAP_RESULTS="${NMAP_RESULTS}${CURRENT_IP}\n"
-            echo -e "${CYAN}      Found: $CURRENT_IP (port 9100 open)${NC}"
-            CURRENT_IP=""
+        if [[ "$line" == *"9100"* ]] && [[ "$line" == *"open"* ]] && [ ! -z "$current_ip" ]; then
+            results="${results}${current_ip}\n"
+            echo -e "${CYAN}      Found: $current_ip (port 9100 open)${NC}"
+            current_ip=""
         fi
-    done <<< "$NMAP_OUTPUT"
+    done <<< "$output"
     
-    NMAP_COUNT=$(echo -e "$NMAP_RESULTS" | grep -c '[0-9]' || echo "0")
-    if [ "$NMAP_COUNT" -gt 0 ]; then
-        echo -e "${GREEN}    Found $NMAP_COUNT printer(s) via port scan${NC}"
-    else
-        echo -e "${YELLOW}    No printers found via port scan${NC}"
-        # Show nmap output for debugging if no results
-        if [ ! -z "$NMAP_OUTPUT" ]; then
-            echo -e "${YELLOW}    nmap output (for debugging):${NC}"
-            echo "$NMAP_OUTPUT" | head -20
+    echo -e "$results"
+}
+
+# Quick scan using nmap if available, otherwise use nc
+NMAP_RESULTS=""
+if command -v nmap &> /dev/null; then
+    echo -e "${CYAN}    Using nmap for scanning (with retries)...${NC}"
+    
+    # Try up to 2 scan attempts
+    for scan_attempt in 1 2; do
+        echo -e "${CYAN}    Scan attempt $scan_attempt/2...${NC}"
+        NMAP_RESULTS=$(run_nmap_scan "$SUBNET")
+        NMAP_COUNT=$(echo -e "$NMAP_RESULTS" | grep -cE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || echo "0")
+        
+        if [ "$NMAP_COUNT" -gt 0 ]; then
+            echo -e "${GREEN}    Found $NMAP_COUNT printer(s) via port scan${NC}"
+            break
+        else
+            echo -e "${YELLOW}    No printers found in attempt $scan_attempt${NC}"
+            if [ "$scan_attempt" -lt 2 ]; then
+                echo -e "${CYAN}    Waiting 5 seconds before retry...${NC}"
+                sleep 5
+            fi
         fi
+    done
+    
+    if [ "$NMAP_COUNT" -eq 0 ]; then
+        echo -e "${YELLOW}    No printers found via nmap after 2 attempts${NC}"
     fi
 else
-    echo -e "${CYAN}    Using basic network scan (installing nmap recommended for faster scans)...${NC}"
+    echo -e "${CYAN}    nmap not available, using basic TCP scan...${NC}"
+    echo -e "${CYAN}    (This may take a while - scanning 254 IPs)${NC}"
+    
     # Fallback: scan common IPs with direct TCP connection
-    NMAP_RESULTS=""
+    # Use parallel scanning for speed
     for i in {1..254}; do
         IP="$SUBNET.$i"
         # Quick check on port 9100 (most common for network printers)
-        # Use 2 second timeout - network printers can be slow to respond
-        if timeout 2 bash -c "echo > /dev/tcp/$IP/9100" 2>/dev/null; then
+        # Use 3 second timeout - network printers can be slow to respond
+        (
+            if timeout 3 bash -c "echo > /dev/tcp/$IP/9100" 2>/dev/null; then
+                echo "$IP"
+            fi
+        ) &
+        
+        # Limit parallel connections to avoid overwhelming the network
+        if [ $((i % 50)) -eq 0 ]; then
+            wait
+            echo -e "${CYAN}    Scanned $i/254 IPs...${NC}"
+        fi
+    done
+    wait
+    
+    # Collect results - re-scan the ones that responded
+    echo -e "${CYAN}    Verifying found printers...${NC}"
+    for i in {1..254}; do
+        IP="$SUBNET.$i"
+        if timeout 3 bash -c "echo > /dev/tcp/$IP/9100" 2>/dev/null; then
             NMAP_RESULTS="${NMAP_RESULTS}${IP}\n"
-            echo -e "${CYAN}      Found: $IP${NC}"
+            echo -e "${CYAN}      Confirmed: $IP${NC}"
         fi
     done
 fi
