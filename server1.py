@@ -91,11 +91,13 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     """Handle HTTP exceptions consistently"""
+    print(f"[HTTP ERROR] {exc.status_code}: {exc.detail}")
     return JSONResponse(
         status_code=exc.status_code,
         content={
             "success": False,
             "error": exc.detail,
+            "status_code": exc.status_code,
             "type": "HTTPException"
         }
     )
@@ -113,8 +115,10 @@ def list_cups_printers() -> list:
     try:
         return list(cups.Connection().getPrinters().keys())
     except cups.IPPError as e:
+        print(f"[CUPS ERROR] IPP error listing printers: {e}")
         raise HTTPException(status_code=500, detail=f"CUPS IPP error: {e}")
     except Exception as e:
+        print(f"[CUPS ERROR] Error listing printers: {e}")
         raise HTTPException(status_code=500, detail=f"CUPS error: {e}")
 
 
@@ -122,7 +126,10 @@ def get_printer_queue(printer_name: str) -> str:
     """Return the CUPS queue name after validating it exists."""
     printers = list_cups_printers()
     if printer_name not in printers:
-        raise HTTPException(status_code=400, detail=f"Unknown CUPS printer/queue: {printer_name}")
+        available = ", ".join(printers) if printers else "none configured"
+        error_msg = f"Printer '{printer_name}' not found. Available printers: {available}"
+        print(f"[PRINTER ERROR] {error_msg}")
+        raise HTTPException(status_code=404, detail=error_msg)
     return printer_name
 
 
