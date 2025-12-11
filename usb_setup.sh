@@ -680,25 +680,100 @@ else
 fi
 echo -e "${CYAN}  Next printer number will be: printer_$NEXT_PRINTER_NUM${NC}"
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# WAIT FOR NETWORK TO STABILIZE
+# This improves discovery reliability, especially after network changes
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+echo ""
+echo -e "${CYAN}  Waiting 5 seconds for network to stabilize...${NC}"
+sleep 5
+
+# Ping the gateway to populate ARP cache and ensure network connectivity
+if [ ! -z "$GATEWAY" ]; then
+    echo -e "${CYAN}  Checking network connectivity (ping gateway)...${NC}"
+    if ping -c 2 -W 2 "$GATEWAY" >/dev/null 2>&1; then
+        echo -e "${GREEN}    ✓ Gateway reachable${NC}"
+    else
+        echo -e "${YELLOW}    ⚠ Gateway not responding, continuing anyway...${NC}"
+    fi
+fi
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# DISCOVERY METHOD 1: Passive discovery via CUPS/lpinfo (mDNS/Bonjour)
+# This finds printers that advertise themselves on the network
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+echo ""
+echo -e "${CYAN}  Method 1: Passive discovery (mDNS/Bonjour via lpinfo)...${NC}"
+LPINFO_RESULTS=""
+if command -v lpinfo &> /dev/null; then
+    # Get socket:// URIs from lpinfo
+    LPINFO_RESULTS=$(lpinfo -v 2>/dev/null | grep -i 'socket://' | awk '{print $2}' | sort -u)
+    LPINFO_COUNT=$(echo "$LPINFO_RESULTS" | grep -c 'socket://' || echo "0")
+    if [ "$LPINFO_COUNT" -gt 0 ]; then
+        echo -e "${GREEN}    Found $LPINFO_COUNT printer(s) via mDNS/Bonjour${NC}"
+        while IFS= read -r uri; do
+            [ -z "$uri" ] && continue
+            echo -e "${CYAN}      → $uri${NC}"
+        done <<< "$LPINFO_RESULTS"
+    else
+        echo -e "${YELLOW}    No printers found via mDNS (printers may not support it)${NC}"
+    fi
+else
+    echo -e "${YELLOW}    lpinfo not available${NC}"
+fi
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# DISCOVERY METHOD 2: Active network scan (nmap or manual)
+# This finds printers by scanning for open port 9100
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+echo ""
+echo -e "${CYAN}  Method 2: Active network scan (port 9100)...${NC}"
+
 # Quick scan using nmap if available, otherwise use nc
 if command -v nmap &> /dev/null; then
-    echo -e "${CYAN}  Using nmap for fast scanning...${NC}"
+    echo -e "${CYAN}    Using nmap for fast scanning...${NC}"
     # Scan for common printer ports with increased timeout for slow printers
     # -T4 = aggressive timing, --host-timeout 30s = max 30s per host
-    SCAN_RESULTS=$(sudo nmap -p 9100,515,631 --open -T4 --host-timeout 30s "$SUBNET.0/24" 2>/dev/null | grep -B 4 "open" | grep "Nmap scan report" | awk '{print $NF}' | tr -d '()')
+    # Using -sT (TCP connect) instead of default SYN scan for better reliability
+    NMAP_RESULTS=$(sudo nmap -sT -p 9100,515,631 --open -T4 --host-timeout 30s "$SUBNET.0/24" 2>/dev/null | grep -B 4 "open" | grep "Nmap scan report" | awk '{print $NF}' | tr -d '()')
+    NMAP_COUNT=$(echo "$NMAP_RESULTS" | grep -c '[0-9]' || echo "0")
+    if [ "$NMAP_COUNT" -gt 0 ]; then
+        echo -e "${GREEN}    Found $NMAP_COUNT printer(s) via port scan${NC}"
+    else
+        echo -e "${YELLOW}    No printers found via port scan${NC}"
+    fi
 else
-    echo -e "${CYAN}  Using basic network scan (installing nmap recommended for faster scans)...${NC}"
+    echo -e "${CYAN}    Using basic network scan (installing nmap recommended for faster scans)...${NC}"
     # Fallback: scan common IPs with netcat
-    SCAN_RESULTS=""
+    NMAP_RESULTS=""
     for i in {1..254}; do
         IP="$SUBNET.$i"
         # Quick check on port 9100 (most common for network printers)
         # Use 1 second timeout - network printers can be slow to respond
         if timeout 1 bash -c "echo > /dev/tcp/$IP/9100" 2>/dev/null; then
-            SCAN_RESULTS="$SCAN_RESULTS$IP\n"
+            NMAP_RESULTS="$NMAP_RESULTS$IP\n"
+            echo -e "${CYAN}      Found: $IP${NC}"
         fi
     done
 fi
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# COMBINE RESULTS FROM BOTH DISCOVERY METHODS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+echo ""
+echo -e "${CYAN}  Combining discovery results...${NC}"
+
+# Extract IPs from lpinfo URIs (socket://192.168.1.100:9100 -> 192.168.1.100)
+LPINFO_IPS=""
+if [ ! -z "$LPINFO_RESULTS" ]; then
+    LPINFO_IPS=$(echo "$LPINFO_RESULTS" | grep -oP 'socket://\K[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | sort -u)
+fi
+
+# Combine NMAP IPs and LPINFO IPs, remove duplicates
+ALL_DISCOVERED_IPS=$(echo -e "${NMAP_RESULTS}\n${LPINFO_IPS}" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -u)
+TOTAL_DISCOVERED=$(echo "$ALL_DISCOVERED_IPS" | grep -c '[0-9]' || echo "0")
+
+echo -e "${GREEN}  Total unique printers discovered: $TOTAL_DISCOVERED${NC}"
 
 # Get already configured printer URIs and names
 EXISTING_URIS=$(lpstat -v 2>/dev/null | grep -oP 'device for \S+: \K.*' | sort -u)
@@ -709,14 +784,19 @@ UPDATED_PRINTERS_COUNT=0
 SKIPPED_PRINTERS_COUNT=0
 
 # Process discovered printers
-if [ ! -z "$SCAN_RESULTS" ]; then
-    echo -e "${GREEN}✓ Found network printer(s)!${NC}"
+if [ ! -z "$ALL_DISCOVERED_IPS" ] && [ "$TOTAL_DISCOVERED" -gt 0 ]; then
+    echo ""
+    echo -e "${GREEN}✓ Processing $TOTAL_DISCOVERED discovered printer(s)...${NC}"
     
     # We'll build an updated registry
     UPDATED_REGISTRY="$MAC_REGISTRY"
     
     while IFS= read -r IP; do
         [ -z "$IP" ] && continue
+        # Skip if not a valid IP
+        if ! echo "$IP" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+            continue
+        fi
         
         echo -e "${YELLOW}  ▸ Checking printer at $IP...${NC}"
         
@@ -874,7 +954,7 @@ print(json.dumps(data, indent=2))
                 SKIPPED_PRINTERS_COUNT=$((SKIPPED_PRINTERS_COUNT + 1))
             fi
         fi
-    done <<< "$(echo -e "$SCAN_RESULTS")"
+    done <<< "$ALL_DISCOVERED_IPS"
     
     # Save updated registry
     if [ "$UPDATED_REGISTRY" != "$MAC_REGISTRY" ]; then
