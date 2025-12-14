@@ -44,7 +44,7 @@ LOGO_FILENAME="${LOGO_FILENAME:-BarakaOS_Logo.png}"
 
 # Default Tailscale auth key (can be overridden in .env)
 # Get a fresh key from: https://login.tailscale.com/admin/settings/keys
-TAILSCALE_AUTH_KEY="${TAILSCALE_AUTH_KEY:-tskey-auth-k3GjhBT6wv11CNTRL-XYKLyGZVVPR9Cv2DC4M4QRD4EmXBJXH2}"
+TAILSCALE_AUTH_KEY="${TAILSCALE_AUTH_KEY:-tskey-auth-kcVfeaMpDz11CNTRL-QDKvR8EGex7t6pcc2sNvw7rxKG8ELPGK}"
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # AUTHENTICATION SETUP (for private repos)
