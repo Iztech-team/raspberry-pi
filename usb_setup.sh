@@ -44,7 +44,7 @@ LOGO_FILENAME="${LOGO_FILENAME:-BarakaOS_Logo.png}"
 
 # Default Tailscale auth key (can be overridden in .env)
 # Get a fresh key from: https://login.tailscale.com/admin/settings/keys
-TAILSCALE_AUTH_KEY="${TAILSCALE_AUTH_KEY:-tskey-auth-kNRU92bhSA11CNTRL-JonwnXCQDCQYbtxTghcrCQqguweLAU5j}"
+TAILSCALE_AUTH_KEY="${TAILSCALE_AUTH_KEY:-tskey-auth-k4hhP6RtvM11CNTRL-crQcMs9B6NYkTTRba4JfNY1tsFkT3HJXH}"
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # AUTHENTICATION SETUP (for private repos)
@@ -588,6 +588,33 @@ echo -e "${CYAN}  This may take up to 30 seconds...${NC}"
 # MAC Registry file locations
 MAC_REGISTRY_PATH="/etc/cups/printer_mac_registry.json"
 MAC_REGISTRY_FALLBACK="$INSTALL_DIR/printer_mac_registry.json"
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# CLEAN UP OLD MAC REGISTRY (fresh start on setup)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+echo -e "${CYAN}  Cleaning up old MAC registry for fresh start...${NC}"
+if [ -f "$MAC_REGISTRY_PATH" ]; then
+    sudo rm -f "$MAC_REGISTRY_PATH"
+    echo -e "${GREEN}    ✓ Removed old registry: $MAC_REGISTRY_PATH${NC}"
+fi
+if [ -f "$MAC_REGISTRY_FALLBACK" ]; then
+    rm -f "$MAC_REGISTRY_FALLBACK"
+    echo -e "${GREEN}    ✓ Removed old registry: $MAC_REGISTRY_FALLBACK${NC}"
+fi
+
+# Also clean up any existing CUPS printers to start fresh
+echo -e "${CYAN}  Removing old printer configurations...${NC}"
+EXISTING_PRINTERS=$(lpstat -p 2>/dev/null | awk '{print $2}')
+if [ ! -z "$EXISTING_PRINTERS" ]; then
+    while IFS= read -r printer; do
+        [ -z "$printer" ] && continue
+        echo -e "${YELLOW}    Removing: $printer${NC}"
+        sudo lpadmin -x "$printer" 2>/dev/null || true
+    done <<< "$EXISTING_PRINTERS"
+    echo -e "${GREEN}    ✓ Old printers removed${NC}"
+else
+    echo -e "${CYAN}    No existing printers to remove${NC}"
+fi
 
 # Function to get MAC address for an IP
 get_mac_address() {
