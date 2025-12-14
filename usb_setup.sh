@@ -44,7 +44,7 @@ LOGO_FILENAME="${LOGO_FILENAME:-BarakaOS_Logo.png}"
 
 # Default Tailscale auth key (can be overridden in .env)
 # Get a fresh key from: https://login.tailscale.com/admin/settings/keys
-TAILSCALE_AUTH_KEY="${TAILSCALE_AUTH_KEY:-tskey-auth-k4hhP6RtvM11CNTRL-crQcMs9B6NYkTTRba4JfNY1tsFkT3HJXH}"
+TAILSCALE_AUTH_KEY="${TAILSCALE_AUTH_KEY:-tskey-auth-k3GjhBT6wv11CNTRL-XYKLyGZVVPR9Cv2DC4M4QRD4EmXBJXH2}"
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # AUTHENTICATION SETUP (for private repos)
@@ -1631,8 +1631,15 @@ if command -v tailscale &> /dev/null; then
         echo -e "    ${GREEN}${BOLD}http://$TAILSCALE_IP:$SERVER_PORT${NC}"
     else
         echo ""
-        echo -e "${YELLOW}  Remote access:${NC} ${RED}Connect to Tailscale first${NC}"
-        echo -e "    ${CYAN}sudo tailscale up${NC}"
+        echo -e "${YELLOW}  Remote access via Tailscale:${NC}"
+        if [ -z "$TAILSCALE_AUTH_KEY" ] || [ "$TAILSCALE_AUTH_KEY" == "tskey-auth-k3GjhBT6wv11CNTRL-XYKLyGZVVPR9Cv2DC4M4QRD4EmXBJXH2" ]; then
+            echo -e "    ${YELLOW}⚠ Auth key is missing or expired${NC}"
+            echo -e "    ${CYAN}Get a new key from: https://login.tailscale.com/admin/settings/keys${NC}"
+            echo -e "    ${CYAN}Then connect with: ${BOLD}sudo tailscale up --authkey=YOUR_KEY${NC}"
+        else
+            echo -e "    ${YELLOW}⚠ Not connected (auth key may be invalid)${NC}"
+            echo -e "    ${CYAN}Connect with: ${BOLD}sudo tailscale up${NC}"
+        fi
     fi
 fi
 
