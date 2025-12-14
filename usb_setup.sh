@@ -88,7 +88,7 @@ echo -e "${GREEN}✓ System updated${NC}"
 echo ""
 echo -e "${YELLOW}[2/8] Installing CUPS and dependencies...${NC}"
 # libcups2-dev is required to build pycups wheels
-sudo apt install -y cups cups-client libcups2-dev git python3 python3-pip python3-venv python3-dev build-essential lsof fonts-dejavu fonts-dejavu-core nmap
+sudo apt install -y cups cups-client libcups2-dev git python3 python3-pip python3-venv python3-dev build-essential lsof fonts-dejavu fonts-dejavu-core nmap curl
 echo -e "${GREEN}✓ CUPS installed${NC}"
 
 # Start and enable CUPS service
