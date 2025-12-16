@@ -996,15 +996,34 @@ def main():
     wait_for_cups()
     
     # Wait for network printers to boot up after power outage
-    # Printers typically take 30-60 seconds to fully boot and become network-accessible
-    printer_boot_delay = int(os.environ.get('PRINTER_BOOT_DELAY', '30'))
+    # WiFi printers typically take 45-90 seconds to fully boot and become network-accessible
+    printer_boot_delay = int(os.environ.get('PRINTER_BOOT_DELAY', '45'))
     print(f"\nWaiting {printer_boot_delay}s for network printers to boot up...")
-    print("  (Set PRINTER_BOOT_DELAY env var to adjust)")
+    print("  (Set PRINTER_BOOT_DELAY env var to adjust, WiFi printers may need 60-90s)")
     time.sleep(printer_boot_delay)
 
     # Discover and add new printers (uses both passive and active scanning)
     print("\nDiscovering and adding new printers...")
     discover_and_add_printers()
+    
+    # Enable all CUPS printer queues (they may be paused after power outage)
+    print("\nEnabling all printer queues...")
+    try:
+        result = subprocess.run(['lpstat', '-p'], capture_output=True, text=True)
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                if line.startswith('printer '):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        pname = parts[1]
+                        try:
+                            subprocess.run(['cupsenable', pname], capture_output=True, timeout=10)
+                            subprocess.run(['cupsaccept', pname], capture_output=True, timeout=10)
+                            print(f"  ✓ Enabled {pname}")
+                        except Exception as e:
+                            print(f"  ⚠ Could not enable {pname}: {e}")
+    except Exception as e:
+        print(f"  ⚠ Error enabling printers: {e}")
     
     # Give a bit more time for everything to stabilize
     print("Waiting 5 seconds for system to stabilize...")
@@ -1055,12 +1074,46 @@ def main():
     
     success_count = 0
     fail_count = 0
+    skipped_count = 0
     
-    max_retries = int(os.environ.get('PRINT_MAX_RETRIES', '3'))
+    max_retries = int(os.environ.get('PRINT_MAX_RETRIES', '5'))
     retry_delay = int(os.environ.get('PRINT_RETRY_DELAY', '10'))
+    printer_check_timeout = int(os.environ.get('PRINTER_CHECK_TIMEOUT', '5'))
     
     for printer in printers:
         print(f"\nProcessing: {printer['name']}")
+        
+        # Extract IP from URI and check if printer is reachable
+        printer_ip = extract_ip_from_uri(printer['uri'])
+        if printer_ip:
+            print(f"  Checking if printer at {printer_ip} is reachable...")
+            is_reachable = False
+            
+            # Try to reach the printer with retries
+            for check_attempt in range(1, max_retries + 1):
+                try:
+                    import socket as sock
+                    s = sock.socket(sock.AF_INET, sock.SOCK_STREAM)
+                    s.settimeout(printer_check_timeout)
+                    result = s.connect_ex((printer_ip, 9100))
+                    s.close()
+                    if result == 0:
+                        is_reachable = True
+                        print(f"  ✓ Printer is reachable (attempt {check_attempt})")
+                        break
+                    else:
+                        print(f"  ⚠ Printer not reachable (attempt {check_attempt}/{max_retries})")
+                except Exception as e:
+                    print(f"  ⚠ Connection check failed: {e}")
+                
+                if check_attempt < max_retries:
+                    print(f"    Waiting {retry_delay}s before retry...")
+                    time.sleep(retry_delay)
+            
+            if not is_reachable:
+                print(f"  ✗ SKIPPED: Printer {printer['name']} at {printer_ip} is not reachable")
+                skipped_count += 1
+                continue
         
         try:
             # Generate receipt image
@@ -1074,7 +1127,7 @@ def main():
             # Print with retry logic (printers may still be booting)
             printed = False
             for attempt in range(1, max_retries + 1):
-                print(f"  Attempt {attempt}/{max_retries}...")
+                print(f"  Print attempt {attempt}/{max_retries}...")
                 if print_receipt(printer['name'], temp_image, script_dir):
                     print(f"  ✓ SUCCESS: Boot notification sent to {printer['name']}")
                     success_count += 1
@@ -1105,6 +1158,7 @@ def main():
     print("=" * 50)
     print(f"  Total Printers: {len(printers)}")
     print(f"  Successful: {success_count}")
+    print(f"  Skipped (unreachable): {skipped_count}")
     print(f"  Failed: {fail_count}")
     print(f"\nCompleted at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 

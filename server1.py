@@ -3,7 +3,9 @@ import uuid
 import base64
 import binascii
 import tempfile
-from typing import Tuple
+import socket
+import time
+from typing import Tuple, Optional
 
 import cups
 from fastapi import FastAPI, UploadFile, HTTPException, Query, Request
@@ -28,6 +30,11 @@ MAX_CONTENT_LENGTH = int(os.getenv("MAX_UPLOAD_SIZE_MB", "20")) * 1024 * 1024
 SERVER_HOST = os.getenv("SERVER_HOST", "0.0.0.0")
 SERVER_PORT = int(os.getenv("SERVER_PORT", "3006"))
 
+# Retry configuration for WiFi printers
+PRINT_MAX_RETRIES = int(os.getenv("PRINT_MAX_RETRIES", "3"))
+PRINT_RETRY_DELAY = float(os.getenv("PRINT_RETRY_DELAY", "2.0"))  # seconds
+PRINTER_TIMEOUT = float(os.getenv("PRINTER_TIMEOUT", "5.0"))  # connection check timeout
+
 app = FastAPI()
 
 app.add_middleware(
@@ -39,6 +46,29 @@ app.add_middleware(
 )
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+
+# ============== STARTUP EVENT ==============
+@app.on_event("startup")
+async def startup_event():
+    """
+    On server startup, try to enable all printers.
+    This helps recover from power outages where CUPS may have paused queues.
+    """
+    print("[STARTUP] Checking and enabling printer queues...")
+    try:
+        printers = list(cups.Connection().getPrinters().keys())
+        for printer_name in printers:
+            try:
+                conn = cups.Connection()
+                conn.enablePrinter(printer_name)
+                conn.acceptJobs(printer_name)
+                print(f"[STARTUP] Enabled printer: {printer_name}")
+            except Exception as e:
+                print(f"[STARTUP] Could not enable {printer_name}: {e}")
+    except Exception as e:
+        print(f"[STARTUP] CUPS not available: {e}")
+    print("[STARTUP] Printer check complete")
 
 
 # ============== GLOBAL ERROR HANDLERS ==============
@@ -122,6 +152,170 @@ def list_cups_printers() -> list:
         raise HTTPException(status_code=500, detail=f"CUPS error: {e}")
 
 
+def get_printer_info(printer_name: str) -> dict:
+    """
+    Get detailed printer information including URI and status.
+    Returns dict with 'uri', 'ip', 'port', 'state', 'state_message', 'is_accepting'.
+    Handles various URI types: socket://, ipp://, ipps://, lpd://, http://
+    """
+    try:
+        conn = cups.Connection()
+        printers = conn.getPrinters()
+        if printer_name not in printers:
+            return None
+        
+        info = printers[printer_name]
+        uri = info.get('device-uri', '')
+        
+        # Extract IP and port from various URI formats
+        # socket://192.168.1.100:9100 (direct network - LAN/WiFi)
+        # ipp://192.168.1.100:631/ipp/print (IPP protocol)
+        # ipps://192.168.1.100:631/ipp/print (IPP over SSL)
+        # lpd://192.168.1.100/queue (LPD protocol)
+        # http://192.168.1.100:80/print (HTTP-based printers)
+        ip = None
+        port = 9100  # Default for socket://
+        printer_type = 'unknown'
+        
+        if '://' in uri:
+            scheme = uri.split('://')[0].lower()
+            addr_part = uri.split('://')[1]
+            
+            # Remove path component (everything after first /)
+            if '/' in addr_part:
+                addr_part = addr_part.split('/')[0]
+            
+            # Handle different schemes
+            if scheme == 'socket':
+                printer_type = 'network_raw'
+                port = 9100
+            elif scheme in ('ipp', 'ipps'):
+                printer_type = 'ipp'
+                port = 631
+            elif scheme == 'lpd':
+                printer_type = 'lpd'
+                port = 515
+            elif scheme in ('http', 'https'):
+                printer_type = 'http'
+                port = 80 if scheme == 'http' else 443
+            elif scheme == 'usb':
+                printer_type = 'usb'
+                # USB printers don't have IP
+                addr_part = None
+            elif scheme == 'serial':
+                printer_type = 'serial'
+                addr_part = None
+            
+            # Extract IP and custom port if present
+            if addr_part:
+                if ':' in addr_part:
+                    ip = addr_part.split(':')[0]
+                    try:
+                        port = int(addr_part.split(':')[1])
+                    except ValueError:
+                        pass
+                else:
+                    ip = addr_part
+                
+                # Validate IP looks like an IP address (not a hostname like 'localhost')
+                import re
+                if ip and not re.match(r'^\d+\.\d+\.\d+\.\d+$', ip):
+                    # It's a hostname, try to resolve it
+                    try:
+                        resolved_ip = socket.gethostbyname(ip)
+                        ip = resolved_ip
+                    except socket.gaierror:
+                        # Could not resolve, keep original for logging
+                        pass
+        
+        return {
+            'name': printer_name,
+            'uri': uri,
+            'ip': ip,
+            'port': port,
+            'type': printer_type,
+            'state': info.get('printer-state', 0),
+            'state_message': info.get('printer-state-message', ''),
+            'state_reasons': info.get('printer-state-reasons', []),
+            'is_accepting': info.get('printer-is-accepting-jobs', True),
+        }
+    except Exception as e:
+        print(f"[ERROR] Could not get printer info for {printer_name}: {e}")
+        return None
+
+
+def check_printer_reachable(ip: str, port: int = 9100, timeout: float = None) -> bool:
+    """
+    Check if a network printer is reachable by testing TCP connection.
+    This is crucial for WiFi printers that may not be ready after power outage.
+    """
+    if not ip:
+        return True  # Can't check non-network printers, assume OK
+    
+    if timeout is None:
+        timeout = PRINTER_TIMEOUT
+    
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        result = sock.connect_ex((ip, port))
+        sock.close()
+        return result == 0
+    except Exception as e:
+        print(f"[PRINTER CHECK] Error checking {ip}:{port} - {e}")
+        return False
+
+
+def ensure_printer_ready(printer_name: str, auto_enable: bool = True) -> Tuple[bool, str]:
+    """
+    Ensure printer is ready to receive jobs:
+    1. Check if printer exists in CUPS
+    2. Check if network printer is reachable (WiFi printers!)
+    3. Check if CUPS queue is accepting jobs
+    4. Auto-enable paused queues if requested
+    
+    Returns (is_ready, message)
+    """
+    info = get_printer_info(printer_name)
+    if not info:
+        return False, f"Printer '{printer_name}' not found in CUPS"
+    
+    # Check network reachability for socket:// printers (WiFi printers)
+    if info['ip']:
+        if not check_printer_reachable(info['ip'], info['port']):
+            return False, f"Printer '{printer_name}' at {info['ip']}:{info['port']} is not reachable (WiFi not connected?)"
+    
+    # Check CUPS queue status
+    # State: 3=idle, 4=processing, 5=stopped
+    if info['state'] == 5:  # Stopped
+        if auto_enable:
+            print(f"[PRINTER] Queue {printer_name} is stopped, attempting to enable...")
+            try:
+                conn = cups.Connection()
+                conn.enablePrinter(printer_name)
+                conn.acceptJobs(printer_name)
+                print(f"[PRINTER] Successfully enabled {printer_name}")
+            except Exception as e:
+                return False, f"Printer queue '{printer_name}' is stopped and could not be enabled: {e}"
+        else:
+            return False, f"Printer queue '{printer_name}' is stopped"
+    
+    # Check if accepting jobs
+    if not info['is_accepting']:
+        if auto_enable:
+            print(f"[PRINTER] Queue {printer_name} not accepting jobs, attempting to enable...")
+            try:
+                conn = cups.Connection()
+                conn.acceptJobs(printer_name)
+                print(f"[PRINTER] {printer_name} now accepting jobs")
+            except Exception as e:
+                return False, f"Printer '{printer_name}' not accepting jobs and could not be enabled: {e}"
+        else:
+            return False, f"Printer '{printer_name}' is not accepting jobs"
+    
+    return True, "Printer ready"
+
+
 def get_printer_queue(printer_name: str) -> str:
     """Return the CUPS queue name after validating it exists."""
     printers = list_cups_printers()
@@ -154,56 +348,594 @@ def collect_output_bytes(printer_obj: Dummy) -> bytes:
     raise HTTPException(status_code=500, detail="Unable to read ESC/POS buffer")
 
 
-def send_to_cups(queue_name: str, data: bytes, title: str) -> int:
-    """Send raw ESC/POS bytes to a CUPS queue as a raw job."""
-    try:
-        conn = cups.Connection()
-        printers = conn.getPrinters()
-        if queue_name not in printers:
-            raise HTTPException(status_code=400, detail=f"CUPS queue '{queue_name}' not found")
-        options = {
-            "raw": "true",
-            "document-format": "application/vnd.cups-raw",
-        }
-        if hasattr(conn, "printData"):
-            return conn.printData(queue_name, title, data, options)
-
-        # Fallback for older pycups without printData: write to a temp file and use printFile
-        with tempfile.NamedTemporaryFile(delete=False) as tmp:
-            tmp.write(data)
-            tmp.flush()
-            tmp_path = tmp.name
+def send_to_cups(queue_name: str, data: bytes, title: str, retry: bool = True) -> int:
+    """
+    Send raw ESC/POS bytes to a CUPS queue as a raw job.
+    
+    With retry=True (default), will:
+    1. Check printer is reachable first (important for WiFi printers!)
+    2. Auto-enable paused CUPS queues
+    3. Retry on failure with configurable delay
+    """
+    last_error = None
+    max_attempts = PRINT_MAX_RETRIES if retry else 1
+    
+    for attempt in range(1, max_attempts + 1):
         try:
-            return conn.printFile(queue_name, tmp_path, title, options)
-        finally:
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
-    except HTTPException:
-        raise
-    except cups.IPPError as e:
-        raise HTTPException(status_code=500, detail=f"CUPS IPP error: {e}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"CUPS error: {e}")
+            # Check printer is ready (reachable + queue accepting)
+            is_ready, message = ensure_printer_ready(queue_name, auto_enable=True)
+            if not is_ready:
+                raise HTTPException(status_code=503, detail=message)
+            
+            conn = cups.Connection()
+            printers = conn.getPrinters()
+            if queue_name not in printers:
+                raise HTTPException(status_code=400, detail=f"CUPS queue '{queue_name}' not found")
+            
+            options = {
+                "raw": "true",
+                "document-format": "application/vnd.cups-raw",
+            }
+            
+            if hasattr(conn, "printData"):
+                job_id = conn.printData(queue_name, title, data, options)
+            else:
+                # Fallback for older pycups without printData
+                with tempfile.NamedTemporaryFile(delete=False) as tmp:
+                    tmp.write(data)
+                    tmp.flush()
+                    tmp_path = tmp.name
+                try:
+                    job_id = conn.printFile(queue_name, tmp_path, title, options)
+                finally:
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+            
+            if attempt > 1:
+                print(f"[PRINT] Success on attempt {attempt} for {queue_name}")
+            return job_id
+            
+        except HTTPException as e:
+            last_error = e
+            if attempt < max_attempts:
+                print(f"[PRINT] Attempt {attempt}/{max_attempts} failed for {queue_name}: {e.detail}")
+                print(f"[PRINT] Retrying in {PRINT_RETRY_DELAY}s...")
+                time.sleep(PRINT_RETRY_DELAY)
+            else:
+                raise
+        except cups.IPPError as e:
+            last_error = HTTPException(status_code=500, detail=f"CUPS IPP error: {e}")
+            if attempt < max_attempts:
+                print(f"[PRINT] CUPS error on attempt {attempt}/{max_attempts}: {e}")
+                time.sleep(PRINT_RETRY_DELAY)
+            else:
+                raise last_error
+        except Exception as e:
+            last_error = HTTPException(status_code=500, detail=f"CUPS error: {e}")
+            if attempt < max_attempts:
+                print(f"[PRINT] Error on attempt {attempt}/{max_attempts}: {e}")
+                time.sleep(PRINT_RETRY_DELAY)
+            else:
+                raise last_error
+    
+    raise last_error
 
 
 @app.get("/")
 @app.get("/health")
 def health():
-    """Health check endpoint (backward compatible)"""
+    """Health check endpoint with printer status"""
+    try:
+        printers = list_cups_printers()
+    except Exception as e:
+        # CUPS not available - return degraded status
+        return {
+            "ok": False,
+            "status": "degraded",
+            "message": "CUPS service not available",
+            "error": str(e),
+            "all_printers_ready": False,
+            "printers": [],
+            "config": {
+                "max_retries": PRINT_MAX_RETRIES,
+                "retry_delay": PRINT_RETRY_DELAY,
+                "timeout": PRINTER_TIMEOUT
+            }
+        }
+    
+    printer_status = []
+    all_ready = True
+    
+    for printer_name in printers:
+        try:
+            info = get_printer_info(printer_name)
+            if info:
+                reachable = check_printer_reachable(info['ip'], info['port']) if info['ip'] else True
+                ready = reachable and info['is_accepting'] and info['state'] != 5
+                if not ready:
+                    all_ready = False
+                printer_status.append({
+                    'name': printer_name,
+                    'ready': ready,
+                    'reachable': reachable,
+                    'ip': info['ip'],
+                    'type': info.get('type', 'unknown')
+                })
+        except Exception as e:
+            print(f"[HEALTH] Error checking printer {printer_name}: {e}")
+            printer_status.append({
+                'name': printer_name,
+                'ready': False,
+                'reachable': False,
+                'error': str(e)
+            })
+            all_ready = False
+    
     return {
         "ok": True,
         "status": "running",
-        "message": "Thermal Printer API with python-escpos",
-        "printers": list_cups_printers()
+        "message": "Thermal Printer API with python-escpos + CUPS",
+        "all_printers_ready": all_ready,
+        "printers": printer_status,
+        "config": {
+            "max_retries": PRINT_MAX_RETRIES,
+            "retry_delay": PRINT_RETRY_DELAY,
+            "timeout": PRINTER_TIMEOUT
+        }
     }
 
 
 @app.get("/printers")
 def get_printers():
-    """List available printers"""
-    return {"printers": list_cups_printers()}
+    """List available printers with their status"""
+    printers = list_cups_printers()
+    return {"printers": printers}
+
+
+@app.get("/printers/status")
+def get_printers_status():
+    """
+    Get detailed status of all printers including reachability.
+    Useful to check if WiFi printers are ready after power outage.
+    """
+    printers = list_cups_printers()
+    status = []
+    
+    for printer_name in printers:
+        info = get_printer_info(printer_name)
+        if info:
+            # Check if reachable
+            reachable = True
+            if info['ip']:
+                reachable = check_printer_reachable(info['ip'], info['port'])
+            
+            status.append({
+                'name': printer_name,
+                'uri': info['uri'],
+                'ip': info['ip'],
+                'port': info['port'],
+                'type': info.get('type', 'unknown'),
+                'reachable': reachable,
+                'state': info['state'],
+                'state_message': info['state_message'],
+                'is_accepting': info['is_accepting'],
+                'ready': reachable and info['is_accepting'] and info['state'] != 5
+            })
+    
+    return {'printers': status}
+
+
+@app.post("/printers/{printer_name}/check")
+@app.get("/printers/{printer_name}/check")
+async def check_printer(printer_name: str):
+    """
+    Check if a specific printer is ready (reachable and queue accepting).
+    Will auto-enable paused queues.
+    """
+    is_ready, message = ensure_printer_ready(printer_name, auto_enable=True)
+    info = get_printer_info(printer_name)
+    
+    return {
+        'printer': printer_name,
+        'ready': is_ready,
+        'message': message,
+        'info': info
+    }
+
+
+@app.post("/printers/{printer_name}/test")
+async def test_printer(printer_name: str):
+    """
+    Send a test print to verify printer is working.
+    Prints a short message with timestamp.
+    """
+    from datetime import datetime
+    
+    try:
+        # First check if printer is ready
+        is_ready, message = ensure_printer_ready(printer_name, auto_enable=True)
+        if not is_ready:
+            return {
+                'success': False,
+                'message': message,
+                'printer': printer_name
+            }
+        
+        # Get printer info
+        info = get_printer_info(printer_name)
+        
+        # Create test print
+        p, queue = create_printer(printer_name)
+        
+        # Print test message
+        p.set(align='center', bold=True, width=2, height=2)
+        p.text("TEST PRINT\n")
+        p.set()
+        
+        p.text("\n")
+        p.set(align='center')
+        p.text(f"Printer: {printer_name}\n")
+        if info and info.get('ip'):
+            p.text(f"IP: {info['ip']}:{info['port']}\n")
+            p.text(f"Type: {info.get('type', 'unknown')}\n")
+        p.text(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        p.text("\n")
+        p.text("If you see this, printer is OK!\n")
+        p.set()
+        
+        p.text('\n\n')
+        p.cut()
+        
+        # Beep to indicate success
+        p._raw(b'\x1b\x42\x02\x02')
+        
+        data = collect_output_bytes(p)
+        job_id = send_to_cups(queue, data, title="test-print")
+        
+        return {
+            'success': True,
+            'message': f"Test print sent to {printer_name}",
+            'printer': printer_name,
+            'job_id': job_id,
+            'printer_info': info
+        }
+        
+    except Exception as e:
+        return {
+            'success': False,
+            'message': str(e),
+            'printer': printer_name
+        }
+
+
+@app.post("/printers/test-all")
+async def test_all_printers():
+    """
+    Send a test print to ALL configured printers.
+    Useful after power outage to verify all printers are working.
+    """
+    from datetime import datetime
+    
+    results = []
+    printers = list_cups_printers()
+    
+    if not printers:
+        return {
+            'success': False,
+            'message': 'No printers configured',
+            'results': []
+        }
+    
+    for printer_name in printers:
+        try:
+            # First check if printer is ready
+            is_ready, message = ensure_printer_ready(printer_name, auto_enable=True)
+            if not is_ready:
+                results.append({
+                    'printer': printer_name,
+                    'success': False,
+                    'message': message
+                })
+                continue
+            
+            # Get printer info
+            info = get_printer_info(printer_name)
+            
+            # Create test print
+            p, queue = create_printer(printer_name)
+            
+            # Print test message
+            p.set(align='center', bold=True, width=2, height=2)
+            p.text("TEST PRINT\n")
+            p.set()
+            
+            p.text("\n")
+            p.set(align='center')
+            p.text(f"Printer: {printer_name}\n")
+            if info and info.get('ip'):
+                p.text(f"IP: {info['ip']}:{info['port']}\n")
+                p.text(f"Type: {info.get('type', 'unknown')}\n")
+            p.text(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            p.text("\n")
+            p.text("If you see this, printer is OK!\n")
+            p.set()
+            
+            p.text('\n\n')
+            p.cut()
+            
+            # Beep to indicate success
+            p._raw(b'\x1b\x42\x02\x02')
+            
+            data = collect_output_bytes(p)
+            job_id = send_to_cups(queue, data, title="test-print")
+            
+            results.append({
+                'printer': printer_name,
+                'success': True,
+                'job_id': job_id,
+                'type': info.get('type', 'unknown') if info else 'unknown'
+            })
+            
+        except Exception as e:
+            results.append({
+                'printer': printer_name,
+                'success': False,
+                'message': str(e)
+            })
+    
+    all_success = all(r['success'] for r in results)
+    
+    return {
+        'success': all_success,
+        'message': f"Tested {len(results)} printers, {sum(1 for r in results if r['success'])} successful",
+        'results': results
+    }
+
+
+@app.post("/printers/{printer_name}/enable")
+async def enable_printer(printer_name: str):
+    """
+    Enable a printer queue that was paused/stopped.
+    Useful after power outage when CUPS may have paused the queue.
+    """
+    try:
+        conn = cups.Connection()
+        printers = conn.getPrinters()
+        
+        if printer_name not in printers:
+            raise HTTPException(status_code=404, detail=f"Printer '{printer_name}' not found")
+        
+        conn.enablePrinter(printer_name)
+        conn.acceptJobs(printer_name)
+        
+        return {
+            'success': True,
+            'message': f"Printer '{printer_name}' enabled and accepting jobs",
+            'printer': printer_name
+        }
+    except cups.IPPError as e:
+        raise HTTPException(status_code=500, detail=f"CUPS error: {e}")
+
+
+@app.post("/printers/enable-all")
+async def enable_all_printers():
+    """
+    Enable all printer queues. Useful after power outage.
+    """
+    printers = list_cups_printers()
+    results = []
+    
+    for printer_name in printers:
+        try:
+            conn = cups.Connection()
+            conn.enablePrinter(printer_name)
+            conn.acceptJobs(printer_name)
+            results.append({'printer': printer_name, 'success': True})
+        except Exception as e:
+            results.append({'printer': printer_name, 'success': False, 'error': str(e)})
+    
+    return {'results': results}
+
+
+@app.get("/jobs")
+@app.get("/printers/jobs")
+async def get_all_jobs():
+    """
+    Get all print jobs from CUPS queue.
+    Useful to check if there are stuck jobs.
+    """
+    try:
+        conn = cups.Connection()
+        jobs = conn.getJobs(which_jobs='all')
+        
+        job_list = []
+        for job_id, job_info in jobs.items():
+            job_list.append({
+                'job_id': job_id,
+                'printer': job_info.get('job-printer-uri', '').split('/')[-1],
+                'title': job_info.get('job-name', ''),
+                'state': job_info.get('job-state', 0),
+                'state_reasons': job_info.get('job-state-reasons', ''),
+                'owner': job_info.get('job-originating-user-name', ''),
+                'size': job_info.get('job-k-octets', 0),
+                'time_created': job_info.get('time-at-creation', 0),
+            })
+        
+        return {
+            'success': True,
+            'total_jobs': len(job_list),
+            'jobs': job_list
+        }
+    except cups.IPPError as e:
+        raise HTTPException(status_code=500, detail=f"CUPS error: {e}")
+
+
+@app.get("/printers/{printer_name}/jobs")
+async def get_printer_jobs(printer_name: str):
+    """
+    Get print jobs for a specific printer.
+    """
+    try:
+        conn = cups.Connection()
+        printers = conn.getPrinters()
+        
+        if printer_name not in printers:
+            raise HTTPException(status_code=404, detail=f"Printer '{printer_name}' not found")
+        
+        jobs = conn.getJobs(which_jobs='all')
+        
+        job_list = []
+        for job_id, job_info in jobs.items():
+            # Filter by printer
+            job_printer = job_info.get('job-printer-uri', '').split('/')[-1]
+            if job_printer == printer_name:
+                job_list.append({
+                    'job_id': job_id,
+                    'title': job_info.get('job-name', ''),
+                    'state': job_info.get('job-state', 0),
+                    'state_reasons': job_info.get('job-state-reasons', ''),
+                    'owner': job_info.get('job-originating-user-name', ''),
+                    'size': job_info.get('job-k-octets', 0),
+                })
+        
+        return {
+            'success': True,
+            'printer': printer_name,
+            'total_jobs': len(job_list),
+            'jobs': job_list
+        }
+    except cups.IPPError as e:
+        raise HTTPException(status_code=500, detail=f"CUPS error: {e}")
+
+
+@app.delete("/jobs/{job_id}")
+@app.post("/jobs/{job_id}/cancel")
+async def cancel_job(job_id: int):
+    """
+    Cancel a specific print job.
+    """
+    try:
+        conn = cups.Connection()
+        conn.cancelJob(job_id)
+        return {
+            'success': True,
+            'message': f"Job {job_id} cancelled",
+            'job_id': job_id
+        }
+    except cups.IPPError as e:
+        raise HTTPException(status_code=500, detail=f"CUPS error: {e}")
+
+
+@app.post("/jobs/cancel-all")
+@app.delete("/jobs")
+async def cancel_all_jobs(printer: str = Query(None, description="Cancel jobs for specific printer only")):
+    """
+    Cancel all print jobs, optionally for a specific printer.
+    Useful to clear stuck jobs after power outage.
+    """
+    try:
+        conn = cups.Connection()
+        jobs = conn.getJobs(which_jobs='not-completed')
+        
+        cancelled = []
+        failed = []
+        
+        for job_id, job_info in jobs.items():
+            # Filter by printer if specified
+            if printer:
+                job_printer = job_info.get('job-printer-uri', '').split('/')[-1]
+                if job_printer != printer:
+                    continue
+            
+            try:
+                conn.cancelJob(job_id)
+                cancelled.append(job_id)
+            except Exception as e:
+                failed.append({'job_id': job_id, 'error': str(e)})
+        
+        return {
+            'success': len(failed) == 0,
+            'cancelled': cancelled,
+            'failed': failed,
+            'total_cancelled': len(cancelled)
+        }
+    except cups.IPPError as e:
+        raise HTTPException(status_code=500, detail=f"CUPS error: {e}")
+
+
+@app.get("/printers/wait")
+@app.post("/printers/wait")
+async def wait_for_printers(
+    printer: str = Query(None, description="Specific printer to wait for (or all if not specified)"),
+    timeout: int = Query(30, description="Maximum seconds to wait"),
+    interval: float = Query(2.0, description="Check interval in seconds")
+):
+    """
+    Wait for printer(s) to become ready. Useful for iOS app to call after power outage.
+    Will keep checking until printer is reachable or timeout.
+    
+    Example: /printers/wait?printer=printer_1&timeout=60
+    """
+    start_time = time.time()
+    timeout = max(5, min(120, timeout))  # Clamp between 5-120 seconds
+    interval = max(0.5, min(10, interval))
+    
+    if printer:
+        # Wait for specific printer
+        printers_to_check = [printer]
+    else:
+        # Wait for all printers
+        try:
+            printers_to_check = list_cups_printers()
+        except:
+            return {
+                'success': False,
+                'message': 'CUPS not available',
+                'ready': [],
+                'not_ready': []
+            }
+    
+    if not printers_to_check:
+        return {
+            'success': True,
+            'message': 'No printers configured',
+            'ready': [],
+            'not_ready': []
+        }
+    
+    ready_printers = []
+    not_ready_printers = list(printers_to_check)
+    attempts = 0
+    
+    while time.time() - start_time < timeout and not_ready_printers:
+        attempts += 1
+        still_not_ready = []
+        
+        for pname in not_ready_printers:
+            is_ready, _ = ensure_printer_ready(pname, auto_enable=True)
+            if is_ready:
+                ready_printers.append(pname)
+            else:
+                still_not_ready.append(pname)
+        
+        not_ready_printers = still_not_ready
+        
+        if not_ready_printers and time.time() - start_time < timeout:
+            time.sleep(interval)
+    
+    elapsed = round(time.time() - start_time, 1)
+    all_ready = len(not_ready_printers) == 0
+    
+    return {
+        'success': all_ready,
+        'message': 'All printers ready' if all_ready else f'{len(not_ready_printers)} printer(s) not ready',
+        'ready': ready_printers,
+        'not_ready': not_ready_printers,
+        'elapsed_seconds': elapsed,
+        'attempts': attempts
+    }
 
 
 @app.post("/print-text")
@@ -230,6 +962,20 @@ async def print_text(
     # Support both 'printer' and 'printer_name' for backward compatibility
     if printer_name:
         printer = printer_name
+    
+    # Validate text
+    if not text or not text.strip():
+        raise HTTPException(status_code=400, detail="Text cannot be empty")
+    
+    # Clamp values to valid ranges
+    width = max(1, min(8, width))
+    height = max(1, min(8, height))
+    underline = max(0, min(2, underline))
+    lines_after = max(0, min(255, lines_after))
+    
+    # Validate alignment
+    if align not in ('left', 'center', 'right'):
+        align = 'left'
     
     try:
         p, queue = create_printer(printer)
@@ -312,6 +1058,10 @@ async def print_image(
     if not allowed_file(image.filename):
         raise HTTPException(status_code=400, detail=f"Invalid image type. Allowed: {ALLOWED_EXTENSIONS}")
     
+    # Clamp values
+    lines_after = max(0, min(255, lines_after))
+    paper_width = max(200, min(600, paper_width))
+    
     # Save uploaded image
     filename = secure_filename(image.filename)
     unique_filename = f"{uuid.uuid4()}_{filename}"
@@ -319,14 +1069,22 @@ async def print_image(
     
     try:
         content = await image.read()
+        if len(content) == 0:
+            raise HTTPException(status_code=400, detail="Empty image file")
         if len(content) > MAX_CONTENT_LENGTH:
             raise HTTPException(status_code=413, detail="File too large")
         
         with open(filepath, "wb") as f:
             f.write(content)
         
-        # Resize image to fit paper width
-        img = Image.open(filepath)
+        # Verify and resize image
+        try:
+            img = Image.open(filepath)
+            img.verify()  # Verify it's a valid image
+            img = Image.open(filepath)  # Re-open after verify
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid or corrupted image: {str(e)}")
+        
         if img.width > paper_width:
             # Calculate new height maintaining aspect ratio
             ratio = paper_width / img.width
@@ -371,17 +1129,19 @@ async def print_image(
             "lines_after": lines_after
         }
         
+    except HTTPException:
+        raise
     except EscposError as e:
         raise HTTPException(status_code=500, detail=f"Printer error: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
     finally:
         # Clean up uploaded file
-        if os.path.exists(filepath):
-            try:
+        try:
+            if 'filepath' in locals() and filepath and os.path.exists(filepath):
                 os.remove(filepath)
-            except:
-                pass
+        except Exception:
+            pass
 
 
 @app.post("/print/qr")
@@ -398,6 +1158,14 @@ async def print_qr(
     
     Example: /print/qr?text=https://example.com&printer=printer_1
     """
+    # Validate input
+    if not text or not text.strip():
+        raise HTTPException(status_code=400, detail="QR text cannot be empty")
+    
+    # Clamp values
+    size = max(1, min(8, size))
+    lines_after = max(0, min(255, lines_after))
+    
     try:
         p, queue = create_printer(printer)
         
@@ -454,6 +1222,20 @@ async def print_barcode(
     
     Example: /print/barcode?code=123456789012&barcode_type=EAN13&printer=printer_1
     """
+    # Validate input
+    if not code or not code.strip():
+        raise HTTPException(status_code=400, detail="Barcode data cannot be empty")
+    
+    # Clamp values
+    height = max(1, min(255, height))
+    width = max(1, min(6, width))
+    lines_after = max(0, min(255, lines_after))
+    
+    # Validate barcode type
+    valid_types = ['UPC-A', 'UPC-E', 'EAN13', 'EAN8', 'CODE39', 'ITF', 'NW7', 'CODABAR', 'CODE93', 'CODE128']
+    if barcode_type.upper() not in [t.upper() for t in valid_types]:
+        barcode_type = 'CODE39'  # Default fallback
+    
     try:
         p, queue = create_printer(printer)
         
@@ -516,6 +1298,9 @@ async def cut_paper(
     if feed is not None:
         lines_before = feed
     
+    # Clamp value
+    lines_before = max(0, min(255, lines_before))
+    
     try:
         p, queue = create_printer(printer)
         
@@ -550,7 +1335,7 @@ async def beep(
     printer_name: str = Query(None, description="Printer name (backward compatibility)"),
     count: int = Query(1, description="Number of beeps (1-9)"),
     duration: int = Query(1, description="Beep duration units (1-9, each ~100ms)"),
-    time: int = Query(None, description="Beep duration (backward compatibility)")
+    beep_time: int = Query(None, alias="time", description="Beep duration (backward compatibility)")
 ):
     """
     Make printer beep
@@ -563,8 +1348,8 @@ async def beep(
         printer = printer_name
     
     # Support both 'time' and 'duration' parameters
-    if time is not None:
-        duration = time
+    if beep_time is not None:
+        duration = beep_time
     
     try:
         p, queue = create_printer(printer)
@@ -616,9 +1401,20 @@ async def print_raw(
     try:
         # Decode data
         if base64_data:
+            # Validate base64 length (prevent huge payloads)
+            if len(base64_data) > MAX_CONTENT_LENGTH * 2:  # base64 is ~1.33x larger
+                raise HTTPException(status_code=413, detail="Raw data too large")
             data = base64.b64decode(base64_data)
         else:
+            if len(hex_data) > MAX_CONTENT_LENGTH * 2:
+                raise HTTPException(status_code=413, detail="Raw data too large")
             data = binascii.unhexlify(hex_data.strip())
+        
+        if len(data) == 0:
+            raise HTTPException(status_code=400, detail="Empty data provided")
+        
+        if len(data) > MAX_CONTENT_LENGTH:
+            raise HTTPException(status_code=413, detail="Raw data too large")
         
         queue = get_printer_queue(printer)
         job_id = send_to_cups(queue, data, title="print-raw")
@@ -631,7 +1427,11 @@ async def print_raw(
             "job_id": job_id,
             "bytes": len(data)
         }
-        
+    
+    except HTTPException:
+        raise
+    except binascii.Error as e:
+        raise HTTPException(status_code=400, detail=f"Invalid hex encoding: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid data encoding: {str(e)}")
 
